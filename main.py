@@ -29,6 +29,7 @@ from src.data.cleaner import clean_data, add_returns
 from src.data.storage import save_csv, load_csv, list_stocks
 from src.strategy import STRATEGY_REGISTRY
 from src.engine import BacktestEngine
+from src.analysis import compute_all, plot_equity_curve, plot_trade_signals
 
 
 def cmd_fetch(args):
@@ -191,6 +192,32 @@ def cmd_backtest(args):
             print(f"    {t['entry_date'].date()} → {t['exit_date'].date()}  "
                   f"{t['pnl']:+,.2f}  ({t['pnl_pct']:+.1f}%)")
 
+    # 完整绩效分析
+    if args.analyze:
+        metrics = compute_all(result)
+        print(f"\n{'='*50}")
+        print(f"  绩效指标")
+        print(f"{'='*50}")
+        print(f"  年化收益率:   {metrics['annual_return_pct']:+.2f}%")
+        print(f"  年化波动率:   {metrics['annual_volatility_pct']:.2f}%")
+        print(f"  夏普比率:     {metrics['sharpe_ratio']:.2f}")
+        print(f"  最大回撤:     {metrics['max_drawdown_pct']:+.1f}%")
+        print(f"  回撤持续:     {metrics['max_dd_duration_days']} 天")
+        print(f"  Calmar 比率:  {metrics['calmar_ratio']:.2f}")
+        print(f"  盈亏比:       {metrics['profit_factor']:.2f}")
+        print(f"  平均盈亏:     {metrics['avg_trade_pnl_pct']:+.2f}%")
+
+        # 生成图表
+        chart1 = plot_equity_curve(
+            result.equity_df, df, title=f"{result.strategy_name} @ {result.symbol}"
+        )
+        chart2 = plot_trade_signals(
+            df, result.trades_df,
+            title=f"{result.strategy_name} @ {result.symbol}"
+        )
+        print(f"\n  图表已保存: {chart1}")
+        print(f"  图表已保存: {chart2}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -241,6 +268,8 @@ def main():
                       help="初始资金（默认 100000）")
     p_bt.add_argument("--position", type=float, default=1.0,
                       help="仓位比例（默认 1.0 = 全仓）")
+    p_bt.add_argument("--analyze", "-a", action="store_true",
+                      help="计算完整绩效指标并生成图表")
 
     args = parser.parse_args()
 
