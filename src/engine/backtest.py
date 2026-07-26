@@ -26,6 +26,7 @@ from typing import Optional
 
 from .broker import Broker, Fill, OrderSide
 from .portfolio import Portfolio
+from ..risk.manager import StopManager
 
 
 @dataclass
@@ -54,6 +55,7 @@ class BacktestEngine:
         commission_rate: float = 0.00025,
         slippage: float = 0.001,
         position_pct: float = 1.0,    # 每次买入使用的资金比例
+        stop_manager: StopManager = None,  # 止损止盈管理器
     ):
         self.initial_capital = initial_capital
         self.broker = Broker(
@@ -61,6 +63,9 @@ class BacktestEngine:
             slippage=slippage,
         )
         self.position_pct = position_pct
+        self.stop_manager = stop_manager or StopManager(
+            stop_loss_pct=0, take_profit_pct=0
+        )
 
     def run(
         self,
@@ -93,7 +98,7 @@ class BacktestEngine:
             close = data["close"].iloc[i]
             signal = int(signals.iloc[i])
 
-            # 买入逻辑：信号从非1变为1，且当前无持仓
+            # 买入逻辑
             if signal == 1 and prev_signal != 1:
                 if pf.position.is_empty:
                     shares = self.broker.calc_shares(
@@ -102,14 +107,29 @@ class BacktestEngine:
                     if shares > 0:
                         fill = self.broker.execute_buy(close, shares)
                         pf.buy(date, fill.price, fill.shares, fill.commission)
+                        self.stop_manager.enter(fill.price, date)
 
-            # 卖出逻辑：信号从1变为非1，且当前有持仓
+            # 卖出逻辑：信号变化
             elif signal != 1 and prev_signal == 1:
                 if not pf.position.is_empty:
                     shares = pf.position.shares
                     fill = self.broker.execute_sell(close, shares)
                     pf.sell(date, fill.price, fill.shares,
                             fill.commission, fill.stamp_duty)
+                    self.stop_manager.reset()
+
+            # 止损止盈检查（在有持仓时）
+            if not pf.position.is_empty and self.stop_manager._active:
+                should_exit, reason = self.stop_manager.check(close, date)
+                if should_exit:
+                    shares = pf.position.shares
+                    fill = self.broker.execute_sell(close, shares)
+                    pf.sell(date, fill.price, fill.shares,
+                            fill.commission, fill.stamp_duty)
+                    # 标记平仓原因
+                    if pf._trades:
+                        pf._trades[-1].exit_reason = reason
+                    self.stop_manager.reset()
 
             # 每日净值快照
             pf.update(date, close)

@@ -30,6 +30,8 @@ from src.data.storage import save_csv, load_csv, list_stocks
 from src.strategy import STRATEGY_REGISTRY
 from src.engine import BacktestEngine
 from src.analysis import compute_all, plot_equity_curve, plot_trade_signals
+from src.analysis.optimizer import grid_search as gs, walk_forward as wf
+from src.risk import StopManager
 
 
 def cmd_fetch(args):
@@ -159,10 +161,17 @@ def cmd_backtest(args):
     strategy = strategy_cls(**params)
     signals = strategy.run(df)
 
+    # 止损止盈设置
+    stop_mgr = StopManager(
+        stop_loss_pct=args.stop_loss / 100 if args.stop_loss else 0,
+        take_profit_pct=args.take_profit / 100 if args.take_profit else 0,
+    )
+
     # 运行回测
     engine = BacktestEngine(
         initial_capital=args.capital,
         position_pct=args.position,
+        stop_manager=stop_mgr,
     )
     result = engine.run(
         df, signals,
@@ -194,6 +203,78 @@ def cmd_backtest(args):
 
     # 完整绩效分析
     if args.analyze:
+        metrics = compute_all(result)
+        print(f"\n{'='*50}")
+        print(f"  绩效指标")
+        print(f"{'='*50}")
+        print(f"  年化收益率:   {metrics['annual_return_pct']:+.2f}%")
+        print(f"  年化波动率:   {metrics['annual_volatility_pct']:.2f}%")
+        print(f"  夏普比率:     {metrics['sharpe_ratio']:.2f}")
+        print(f"  最大回撤:     {metrics['max_drawdown_pct']:+.1f}%")
+        print(f"  回撤持续:     {metrics['max_dd_duration_days']} 天")
+        print(f"  Calmar 比率:  {metrics['calmar_ratio']:.2f}")
+        print(f"  盈亏比:       {metrics['profit_factor']:.2f}")
+        print(f"  平均盈亏:     {metrics['avg_trade_pnl_pct']:+.2f}%")
+
+        chart1 = plot_equity_curve(
+            result.equity_df, df, title=f"{result.strategy_name} @ {result.symbol}"
+        )
+        chart2 = plot_trade_signals(
+            df, result.trades_df,
+            title=f"{result.strategy_name} @ {result.symbol}"
+        )
+        print(f"\n  图表已保存: {chart1}")
+        print(f"  图表已保存: {chart2}")
+
+
+def cmd_optimize(args):
+    """参数优化"""
+    df = load_csv(args.symbol, processed=True)
+
+    strategy_cls = STRATEGY_REGISTRY.get(args.strategy)
+    if strategy_cls is None:
+        print(f"未知策略: {args.strategy}")
+        return
+
+    # 解析参数范围: "fast=5,10,15;slow=20,30,60"
+    param_grid = {}
+    for part in args.params.split(";"):
+        key, vals = part.split("=")
+        param_grid[key.strip()] = [int(v) for v in vals.split(",")]
+
+    if args.mode == "grid":
+        print(f"\n网格搜索: {strategy_cls.__name__} @ {args.symbol}")
+        print(f"参数空间: {param_grid}")
+
+        result_df = gs(df, strategy_cls, param_grid, metric="sharpe")
+
+        if len(result_df) == 0:
+            print("无有效结果")
+            return
+
+        print(f"\n{'='*70}")
+        print(f"  Top 10 参数组合（按夏普排序）")
+        print(f"{'='*70}")
+        cols = list(param_grid.keys()) + ["total_return_pct", "sharpe", "max_dd_pct", "n_trades"]
+        print(result_df[cols].head(10).to_string(index=False))
+
+    elif args.mode == "walkforward":
+        print(f"\n滚动优化: {strategy_cls.__name__} @ {args.symbol}")
+        print(f"参数空间: {param_grid}")
+
+        result_df = wf(df, strategy_cls, param_grid, metric="sharpe")
+
+        if len(result_df) == 0:
+            print("数据不足，无法执行滚动优化")
+            return
+
+        print(f"\n{'='*90}")
+        print(f"  滚动窗口结果")
+        print(f"{'='*90}")
+        show_cols = ["fold", "test_period"] + [f"best_{k}" for k in param_grid] + \
+                    ["train_sharpe", "test_sharpe", "test_return", "test_max_dd"]
+        available = [c for c in show_cols if c in result_df.columns]
+        print(result_df[available].to_string(index=False))
         metrics = compute_all(result)
         print(f"\n{'='*50}")
         print(f"  绩效指标")
@@ -270,6 +351,20 @@ def main():
                       help="仓位比例（默认 1.0 = 全仓）")
     p_bt.add_argument("--analyze", "-a", action="store_true",
                       help="计算完整绩效指标并生成图表")
+    p_bt.add_argument("--stop-loss", type=float, default=0,
+                      help="止损比例（%%，如 5 = 亏5%%平仓）")
+    p_bt.add_argument("--take-profit", type=float, default=0,
+                      help="止盈比例（%%，如 15 = 赚15%%平仓）")
+
+    # optimize 命令
+    p_opt = subparsers.add_parser("optimize", help="参数优化")
+    p_opt.add_argument("mode", choices=["grid", "walkforward"],
+                       help="grid=网格搜索, walkforward=滚动优化")
+    p_opt.add_argument("strategy", choices=list(STRATEGY_REGISTRY.keys()),
+                       help="策略名称")
+    p_opt.add_argument("symbol", help="股票代码")
+    p_opt.add_argument("--params", "-p", required=True,
+                       help="参数范围，格式 key=1,2,3;key2=10,20，分号分隔")
 
     args = parser.parse_args()
 
@@ -283,6 +378,8 @@ def main():
         cmd_signal(args)
     elif args.command == "backtest":
         cmd_backtest(args)
+    elif args.command == "optimize":
+        cmd_optimize(args)
     else:
         parser.print_help()
 
