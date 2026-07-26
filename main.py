@@ -32,6 +32,7 @@ from src.engine import BacktestEngine
 from src.analysis import compute_all, plot_equity_curve, plot_trade_signals
 from src.analysis.optimizer import grid_search as gs, walk_forward as wf
 from src.risk import StopManager
+from src.analysis.report import generate_report
 
 
 def cmd_fetch(args):
@@ -300,6 +301,50 @@ def cmd_optimize(args):
         print(f"  图表已保存: {chart2}")
 
 
+def cmd_compare(args):
+    """多策略对比"""
+    strategies = args.strategies.split(",")
+    df = load_csv(args.symbol, processed=True)
+    results = []
+
+    print(f"\n多策略对比: {args.symbol}")
+    print(f"{'='*60}")
+
+    for sname in strategies:
+        sname = sname.strip()
+        strategy_cls = STRATEGY_REGISTRY.get(sname)
+        if strategy_cls is None:
+            print(f"  未知策略: {sname}，跳过")
+            continue
+
+        # 解析参数
+        params = {}
+        if args.param:
+            for p in args.param:
+                key, val = p.split("=")
+                try:
+                    val = float(val)
+                    if val == int(val):
+                        val = int(val)
+                except ValueError:
+                    pass
+                params[key] = val
+
+        strategy = strategy_cls(**params)
+        signals = strategy.run(df)
+        engine = BacktestEngine(initial_capital=args.capital)
+        result = engine.run(df, signals, symbol=args.symbol, strategy_name=strategy.describe())
+        results.append(result)
+
+        m = result.summary
+        print(f"  {strategy.describe():40s}  {m['total_return_pct']:+7.2f}%  "
+              f"胜率:{m['win_rate']:5.1f}%  交易:{m['n_trades']:2d}次")
+
+    if len(results) > 1:
+        report = generate_report(results, save=True)
+        print(report)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Quant Learning - 迷你A股回测框架",
@@ -366,6 +411,16 @@ def main():
     p_opt.add_argument("--params", "-p", required=True,
                        help="参数范围，格式 key=1,2,3;key2=10,20，分号分隔")
 
+    # compare 命令
+    p_cmp = subparsers.add_parser("compare", help="多策略对比")
+    p_cmp.add_argument("symbol", help="股票代码")
+    p_cmp.add_argument("--strategies", "-s", required=True,
+                       help="策略列表，逗号分隔，如 ma_cross,macd,rsi")
+    p_cmp.add_argument("--param", "-p", action="append",
+                       help="策略参数（所有策略共用）")
+    p_cmp.add_argument("--capital", type=float, default=100000,
+                       help="初始资金")
+
     args = parser.parse_args()
 
     if args.command == "fetch":
@@ -380,6 +435,8 @@ def main():
         cmd_backtest(args)
     elif args.command == "optimize":
         cmd_optimize(args)
+    elif args.command == "compare":
+        cmd_compare(args)
     else:
         parser.print_help()
 
