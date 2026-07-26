@@ -28,6 +28,7 @@ from src.data.fetcher import fetch_stock_daily
 from src.data.cleaner import clean_data, add_returns
 from src.data.storage import save_csv, load_csv, list_stocks
 from src.strategy import STRATEGY_REGISTRY
+from src.engine import BacktestEngine
 
 
 def cmd_fetch(args):
@@ -130,6 +131,67 @@ def cmd_signal(args):
         print(f"  {row['date'].date()}  {sig}  收盘价: {row['close']:.2f}")
 
 
+def cmd_backtest(args):
+    """运行回测"""
+    df = load_csv(args.symbol, processed=True)
+
+    strategy_cls = STRATEGY_REGISTRY.get(args.strategy)
+    if strategy_cls is None:
+        print(f"未知策略: {args.strategy}")
+        print(f"可用策略: {', '.join(STRATEGY_REGISTRY.keys())}")
+        return
+
+    # 解析策略参数
+    params = {}
+    if args.param:
+        for p in args.param:
+            key, val = p.split("=")
+            try:
+                val = float(val)
+                if val == int(val):
+                    val = int(val)
+            except ValueError:
+                pass
+            params[key] = val
+
+    # 生成信号
+    strategy = strategy_cls(**params)
+    signals = strategy.run(df)
+
+    # 运行回测
+    engine = BacktestEngine(
+        initial_capital=args.capital,
+        position_pct=args.position,
+    )
+    result = engine.run(
+        df, signals,
+        symbol=args.symbol,
+        strategy_name=strategy.describe(),
+    )
+
+    # 输出结果
+    s = result.summary
+    print(f"\n{'='*50}")
+    print(f"  回测结果")
+    print(f"{'='*50}")
+    print(f"  策略: {result.strategy_name}")
+    print(f"  标的: {result.symbol}")
+    print(f"  初始资金: {s['initial_capital']:,.2f}")
+    print(f"  最终净值: {s['final_equity']:,.2f}")
+    print(f"  总收益率: {s['total_return_pct']:+.2f}%")
+    print(f"  交易次数: {s['n_trades']}")
+    print(f"  胜率:     {s['win_rate']:.1f}%")
+    print(f"  总盈亏:   {s['total_pnl']:+,.2f}")
+
+    # 最近几笔交易
+    trades = result.trades_df
+    if len(trades) > 0:
+        print(f"\n  最近 5 笔交易:")
+        for _, t in trades.tail(5).iterrows():
+            print(f"    {t['entry_date'].date()} → {t['exit_date'].date()}  "
+                  f"{t['pnl']:+,.2f}  ({t['pnl_pct']:+.1f}%)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Quant Learning - 迷你A股回测框架",
@@ -166,8 +228,19 @@ def main():
                           help="策略名称")
     p_signal.add_argument("symbol", help="股票代码")
     p_signal.add_argument("--param", "-p", action="append",
-                          help="策略参数，格式 key=value（可多次使用）\n"
-                               "示例: --param fast=10 --param slow=30")
+                          help="策略参数，格式 key=value（可多次使用）")
+
+    # backtest 命令
+    p_bt = subparsers.add_parser("backtest", help="运行回测")
+    p_bt.add_argument("strategy", choices=list(STRATEGY_REGISTRY.keys()),
+                      help="策略名称")
+    p_bt.add_argument("symbol", help="股票代码")
+    p_bt.add_argument("--param", "-p", action="append",
+                      help="策略参数，格式 key=value")
+    p_bt.add_argument("--capital", type=float, default=100000,
+                      help="初始资金（默认 100000）")
+    p_bt.add_argument("--position", type=float, default=1.0,
+                      help="仓位比例（默认 1.0 = 全仓）")
 
     args = parser.parse_args()
 
@@ -179,6 +252,8 @@ def main():
         cmd_info(args)
     elif args.command == "signal":
         cmd_signal(args)
+    elif args.command == "backtest":
+        cmd_backtest(args)
     else:
         parser.print_help()
 
