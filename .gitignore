@@ -16,6 +16,9 @@ venv/
 .vscode/
 .idea/
 
+# Zhihu drafts (not part of the project)
+zhihu/
+
 # OS
 .DS_Store
 Thumbs.db
