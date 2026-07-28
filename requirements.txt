@@ -2,3 +2,4 @@ pandas>=2.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
 akshare>=1.11.0
+statsmodels>=0.14.0
