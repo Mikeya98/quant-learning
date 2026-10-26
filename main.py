@@ -21,6 +21,8 @@ import argparse
 import sys
 import os
 
+import pandas as pd
+
 # 确保 src 在 Python 路径中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,8 +30,11 @@ from src.data.fetcher import fetch_stock_daily
 from src.data.cleaner import clean_data, add_returns
 from src.data.storage import save_csv, load_csv, list_stocks
 from src.strategy import STRATEGY_REGISTRY
-from src.engine import BacktestEngine
-from src.analysis import compute_all, plot_equity_curve, plot_trade_signals
+from src.engine import BacktestEngine, MultiAssetBacktester, format_report
+from src.analysis import (
+    compute_all, plot_equity_curve, plot_trade_signals,
+    plot_portfolio, plot_correlation,
+)
 from src.analysis.optimizer import grid_search as gs, walk_forward as wf
 from src.risk import StopManager
 from src.analysis.report import generate_report
@@ -56,7 +61,7 @@ def cmd_fetch(args):
     print(f"  最早日期: {df_clean['date'].min().date()}")
     print(f"  最晚日期: {df_clean['date'].max().date()}")
     print(f"  停牌天数: {df_clean['suspended'].sum()}")
-    print(f"  累计收益: {df_clean['cum_ret'].iloc[-1]:.2%}")
+    print(f"  累计收益: {df_clean['cum_ret'].iloc[-1] - 1:+.2%}")
 
 
 def cmd_list(args):
@@ -81,7 +86,7 @@ def cmd_info(args):
     print(f"\n收益统计:")
     print(f"  日均收益率: {df['ret'].mean():.4%}")
     print(f"  日收益率标准差: {df['ret'].std():.4%}")
-    print(f"  累计收益: {df['cum_ret'].iloc[-1]:.2%}")
+    print(f"  累计收益: {df['cum_ret'].iloc[-1] - 1:+.2%}")
     print(f"  最大单日涨幅: {df['ret'].max():.2%}")
     print(f"  最大单日跌幅: {df['ret'].min():.2%}")
 
@@ -345,6 +350,126 @@ def cmd_compare(args):
         print(report)
 
 
+def _parse_params(param_list):
+    """解析 --param key=value（可多次使用）"""
+    params = {}
+    if not param_list:
+        return params
+    for p in param_list:
+        key, val = p.split("=")
+        try:
+            val = float(val)
+            if val == int(val):
+                val = int(val)
+        except ValueError:
+            pass
+        params[key] = val
+    return params
+
+
+def cmd_fetch_all(args):
+    """批量下载多只股票"""
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    print(f"\n批量下载 {len(symbols)} 只股票: {', '.join(symbols)}")
+
+    ok, failed = [], []
+    for symbol in symbols:
+        try:
+            df = fetch_stock_daily(
+                symbol=symbol, start_date=args.start,
+                end_date=args.end, adjust=args.adjust,
+            )
+            save_csv(df, symbol, processed=False)
+            df = add_returns(clean_data(df))
+            save_csv(df, symbol, processed=True)
+            ok.append(symbol)
+        except Exception as e:
+            print(f"  [FAIL] {symbol}: {e}")
+            failed.append(symbol)
+
+    print(f"\n完成: 成功 {len(ok)} 只, 失败 {len(failed)} 只")
+    if failed:
+        print(f"  失败: {', '.join(failed)}")
+
+
+def cmd_portfolio(args):
+    """多标的组合回测"""
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 2:
+        print("组合回测至少需要 2 只股票")
+        return
+
+    strategy_cls = STRATEGY_REGISTRY.get(args.strategy)
+    if strategy_cls is None:
+        print(f"未知策略: {args.strategy}")
+        print(f"可用策略: {', '.join(STRATEGY_REGISTRY.keys())}")
+        return
+
+    params = _parse_params(args.param)
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+
+    data, signals = {}, {}
+    missing = []
+
+    for symbol in symbols:
+        try:
+            df = load_csv(symbol, processed=True)
+        except FileNotFoundError:
+            missing.append(symbol)
+            continue
+
+        df = df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+        if len(df) < 60:
+            print(f"[WARN] {symbol} 在区间内只有 {len(df)} 条数据")
+            continue
+
+        data[symbol] = df
+        strategy = strategy_cls(**params)
+        signals[symbol] = strategy.run(df)
+
+    if missing:
+        print(f"\n缺少数据: {', '.join(missing)}")
+        print(f"先运行: python main.py fetch-all {','.join(missing)} "
+              f"--start {args.start} --end {args.end}")
+        return
+
+    if len(data) < 2:
+        print("可用标的不够, 无法组合回测")
+        return
+
+    strategy_name = strategy_cls(**params).describe()
+
+    print(f"\n组合回测: {len(data)} 只标的, {strategy_name}")
+    print(f"区间: {args.start} ~ {args.end}, 调仓周期: {args.rebalance} 日")
+
+    engine = MultiAssetBacktester(
+        initial_capital=args.capital,
+        rebalance_days=args.rebalance,
+    )
+    result = engine.run(
+        data, signals,
+        alloc=args.alloc,
+        top_n=args.top,
+        momentum_window=args.momentum_window,
+        strategy_name=strategy_name,
+    )
+
+    print("\n" + format_report(result))
+
+    print("\n" + "-" * 62)
+    print("  日收益率相关矩阵")
+    print("-" * 62)
+    print(result.correlation.round(2).to_string())
+
+    if args.analyze:
+        for path in plot_portfolio(result):
+            print(f"\n  图表已保存: {path}")
+        path = plot_correlation(result)
+        if path:
+            print(f"  图表已保存: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Quant Learning - 迷你A股回测框架",
@@ -421,6 +546,40 @@ def main():
     p_cmp.add_argument("--capital", type=float, default=100000,
                        help="初始资金")
 
+    # fetch-all 命令
+    p_fa = subparsers.add_parser("fetch-all", help="批量下载多只股票")
+    p_fa.add_argument("symbols", help="股票代码列表，逗号分隔")
+    p_fa.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fa.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    p_fa.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", ""],
+                      help="复权方式: qfq=前复权(默认)")
+
+    # portfolio 命令
+    p_pf = subparsers.add_parser("portfolio", help="多标的组合回测")
+    p_pf.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_pf.add_argument("--strategy", default="ma_cross",
+                      choices=list(STRATEGY_REGISTRY.keys()),
+                      help="每个标的使用的策略")
+    p_pf.add_argument("--param", "-p", action="append",
+                      help="策略参数，格式 key=value")
+    p_pf.add_argument("--alloc", choices=["equal", "momentum"], default="equal",
+                      help="equal=等权, momentum=动量排序取前 N")
+    p_pf.add_argument("--top", type=int, default=3,
+                      help="momentum 模式持有几只（默认 3）")
+    p_pf.add_argument("--momentum-window", type=int, default=20,
+                      help="动量回看天数（默认 20）")
+    p_pf.add_argument("--rebalance", type=int, default=5,
+                      help="调仓周期，交易日（默认 5）")
+    p_pf.add_argument("--capital", type=float, default=100000,
+                      help="初始资金（默认 100000）")
+    p_pf.add_argument("--start", default="20190101",
+                      help="起始日期 YYYYMMDD")
+    p_pf.add_argument("--end", default="20241231",
+                      help="结束日期 YYYYMMDD")
+    p_pf.add_argument("--analyze", "-a", action="store_true",
+                      help="生成净值和权重图表")
+
     args = parser.parse_args()
 
     if args.command == "fetch":
@@ -437,6 +596,10 @@ def main():
         cmd_optimize(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "fetch-all":
+        cmd_fetch_all(args)
+    elif args.command == "portfolio":
+        cmd_portfolio(args)
     else:
         parser.print_help()
 

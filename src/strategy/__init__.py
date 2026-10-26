@@ -16,6 +16,12 @@ from .macd import MACDStrategy
 from .rsi import RSIStrategy
 from .bollinger import BollingerStrategy
 
+# 实时指标（增量递推版本，用于实盘/模拟交易）
+from .realtime_indicators import (
+    OnlineSMA, OnlineEMA, OnlineMACD, OnlineRSI, OnlineBollinger,
+    RealtimeIndicatorCalculator,
+)
+
 # 策略注册表（CLI 通过名称查找策略）
 STRATEGY_REGISTRY = {
     "ma_cross": MACrossStrategy,

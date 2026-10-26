@@ -15,6 +15,93 @@ import akshare as ak
 import pandas as pd
 
 
+def _fetch_eastmoney(symbol: str, start_date: str, end_date: str,
+                     adjust: str):
+    """东方财富接口（主数据源），失败返回 None"""
+    max_retries = 3
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return ak.stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"[fetcher] 第 {attempt} 次尝试失败，{wait}s 后重试...")
+                time.sleep(wait)
+
+    print(f"[fetcher] 东方财富接口失败: {last_error}")
+    return None
+
+
+def _market_prefix(symbol: str) -> str:
+    """给 6 位代码加交易所前缀（新浪/腾讯接口要求）"""
+    if symbol.startswith(("6", "9")):
+        return "sh"
+    if symbol.startswith(("4", "8")):
+        return "bj"
+    return "sz"
+
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """把不同数据源返回的列统一成标准格式"""
+    df = df.copy()
+
+    rename = {
+        "日期": "date", "开盘": "open", "收盘": "close",
+        "最高": "high", "最低": "low", "成交量": "volume",
+        "成交额": "amount", "换手率": "turnover",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if "amount" not in df.columns:
+        df["amount"] = 0.0
+    if "turnover" not in df.columns:
+        df["turnover"] = 0.0
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+    keep = ["date", "open", "high", "low", "close", "volume",
+            "amount", "turnover"]
+    return df[[c for c in keep if c in df.columns]]
+
+
+def _fetch_fallback(symbol: str, start_date: str, end_date: str,
+                    adjust: str):
+    """备用数据源：新浪 → 腾讯"""
+    code = _market_prefix(symbol) + symbol
+
+    sources = [
+        ("sina", lambda: ak.stock_zh_a_daily(
+            symbol=code, start_date=start_date,
+            end_date=end_date, adjust=adjust)),
+        ("tencent", lambda: ak.stock_zh_a_hist_tx(
+            symbol=code, start_date=start_date,
+            end_date=end_date, adjust=adjust)),
+    ]
+
+    for name, fn in sources:
+        try:
+            df = fn()
+            if df is None or len(df) == 0:
+                continue
+            df = _normalize(df)
+            print(f"[fetcher] 备用源 {name} 成功: {len(df)} 条")
+            return df
+        except Exception as e:
+            print(f"[fetcher] 备用源 {name} 失败: {e}")
+
+    return None
+
+
 def fetch_stock_daily(
     symbol: str,
     start_date: str = "20100101",
@@ -50,34 +137,15 @@ def fetch_stock_daily(
     """
     print(f"[fetcher] 正在下载 {symbol} 数据 ({start_date} ~ {end_date}, {adjust or '不复权'})...")
 
-    # 网络请求重试（东方财富 API 偶发断连，重试 3 次）
-    max_retries = 3
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust,
-            )
-            break  # 成功，跳出重试循环
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                wait = 2 ** attempt  # 指数退避: 2s, 4s, 8s
-                print(f"[fetcher] 第 {attempt} 次尝试失败，{wait}s 后重试...")
-                time.sleep(wait)
-    else:
-        # 所有重试均失败
-        raise RuntimeError(
-            f"下载 {symbol} 数据失败（重试 {max_retries} 次后仍失败）: {last_error}\n"
-            f"请检查: 1) 网络连接 2) 股票代码是否正确 3) akshare 版本"
-        )
+    df = _fetch_eastmoney(symbol, start_date, end_date, adjust)
+
+    if df is None:
+        # 东方财富接口被限流或临时不可用时，换新浪/腾讯的数据源
+        print("[fetcher] 东方财富接口不可用，尝试备用数据源...")
+        df = _fetch_fallback(symbol, start_date, end_date, adjust)
 
     if df is None or len(df) == 0:
-        raise ValueError(f"{symbol} 在指定日期范围内无数据")
+        raise ValueError(f"{symbol} 在指定日期范围内无数据（所有数据源均失败）")
 
     # akshare 返回的列名是中文，重命名为英文
     column_map = {
