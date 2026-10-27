@@ -38,6 +38,11 @@ from src.analysis import (
 from src.analysis.optimizer import grid_search as gs, walk_forward as wf
 from src.risk import StopManager
 from src.analysis.report import generate_report
+from src.analysis.factor_research import (
+    compute_forward_returns, compute_ic, quantile_returns, quantile_summary,
+    make_factors, format_ic_report,
+)
+from src.analysis.factor_visualize import plot_ic, plot_quantiles
 
 
 def cmd_fetch(args):
@@ -470,6 +475,88 @@ def cmd_portfolio(args):
             print(f"  图表已保存: {path}")
 
 
+def _load_universe(symbols, start, end):
+    """把多只股票的 CSV 拼成宽表 (index=日期, columns=代码)"""
+    fields = {"close": {}, "volume": {}, "turnover": {}}
+    missing = []
+
+    for symbol in symbols:
+        try:
+            df = load_csv(symbol, processed=True)
+        except FileNotFoundError:
+            missing.append(symbol)
+            continue
+
+        df = df[(df["date"] >= start) & (df["date"] <= end)]
+        if df.empty:
+            missing.append(symbol)
+            continue
+
+        df = df.set_index("date")
+        for name in fields:
+            if name in df.columns:
+                fields[name][symbol] = df[name]
+
+    if missing:
+        print(f"[WARN] 跳过无数据的标的: {', '.join(missing)}")
+
+    close = pd.DataFrame(fields["close"]).sort_index()
+    volume = pd.DataFrame(fields["volume"]).sort_index() if fields["volume"] else None
+    turnover = pd.DataFrame(fields["turnover"]).sort_index() if fields["turnover"] else None
+    return close, volume, turnover
+
+
+def cmd_factor(args):
+    """因子 IC 分析与分层回测"""
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+
+    close, volume, turnover = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只, IC 分析至少需要 5 只")
+        return
+
+    print(f"\n因子研究: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}, "
+          f"持有期 {args.period} 日")
+
+    factors = make_factors(close, volume, turnover)
+    if args.factors:
+        wanted = [f.strip() for f in args.factors.split(",")]
+        unknown = [f for f in wanted if f not in factors]
+        if unknown:
+            print(f"未知因子: {', '.join(unknown)}")
+            print(f"可用因子: {', '.join(factors.keys())}")
+            return
+        factors = {k: factors[k] for k in wanted}
+
+    fwd = compute_forward_returns(close, periods=args.period)
+
+    results = {}
+    qsummaries = {}
+    for name, fac in factors.items():
+        r = compute_ic(fac, fwd, method=args.method)
+        r.periods = args.period
+        results[name] = r
+        if args.quantiles:
+            qret = quantile_returns(fac, fwd, n_quantiles=args.quantiles)
+            qsummaries[name] = quantile_summary(
+                qret, holding_period=args.period)
+
+    print("\n" + format_ic_report(results, qsummaries))
+
+    if args.analyze:
+        for name, r in results.items():
+            for path in plot_ic(r, holdings=args.period, title=name):
+                print(f"\n  图表已保存: {path}")
+            if args.quantiles:
+                qret = quantile_returns(factors[name], fwd, args.quantiles)
+                for path in plot_quantiles(qret, holdings=args.period, title=name):
+                    print(f"  图表已保存: {path}")
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Quant Learning - 迷你A股回测框架",
@@ -580,6 +667,23 @@ def main():
     p_pf.add_argument("--analyze", "-a", action="store_true",
                       help="生成净值和权重图表")
 
+    # factor 命令
+    p_fa2 = subparsers.add_parser("factor", help="因子 IC 分析与分层回测")
+    p_fa2.add_argument("--symbols", required=True,
+                       help="股票代码列表，逗号分隔")
+    p_fa2.add_argument("--factors", default="",
+                       help="要分析的因子，逗号分隔（默认全部）")
+    p_fa2.add_argument("--period", type=int, default=5,
+                       help="未来收益的持有期，交易日（默认 5）")
+    p_fa2.add_argument("--method", choices=["spearman", "pearson"],
+                       default="spearman", help="相关系数类型（默认 rank IC）")
+    p_fa2.add_argument("--quantiles", type=int, default=5,
+                       help="分层数量（默认 5，0 表示不分层）")
+    p_fa2.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fa2.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    p_fa2.add_argument("--analyze", "-a", action="store_true",
+                       help="生成 IC 和分层图表")
+
     args = parser.parse_args()
 
     if args.command == "fetch":
@@ -600,6 +704,8 @@ def main():
         cmd_fetch_all(args)
     elif args.command == "portfolio":
         cmd_portfolio(args)
+    elif args.command == "factor":
+        cmd_factor(args)
     else:
         parser.print_help()
 
