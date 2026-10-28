@@ -43,6 +43,10 @@ from src.analysis.factor_research import (
     make_factors, format_ic_report,
 )
 from src.analysis.factor_visualize import plot_ic, plot_quantiles
+from src.analysis.neutralize import (
+    neutralize_factor, size_exposure, industry_exposure,
+)
+from src.data.meta import load_industry, float_mktcap, log_size
 
 
 def cmd_fetch(args):
@@ -397,6 +401,65 @@ def cmd_fetch_all(args):
         print(f"  失败: {', '.join(failed)}")
 
 
+def cmd_universe(args):
+    """选股票池：全市场快照 → 按流通市值取前 N → 可选下载历史"""
+    from src.data.universe import build_universe, save_universe
+    from src.data.meta import save_industry
+
+    print(f"\n选池: 全市场快照 → 流通市值前 {args.top} 只")
+    try:
+        pool = build_universe(top_n=args.top)
+    except Exception as e:                       # noqa: BLE001
+        print(f"[FAIL] 选池失败: {e}")
+        print("  接口限流时可以隔几分钟再试；已有股票池文件仍然可用。")
+        return
+
+    path = save_universe(pool)
+    print(f"[universe] 已保存: {path} ({len(pool)} 只)")
+
+    show = pool.head(20)
+    print(f"\n{'代码':<8}{'名称':<10}{'行业':<12}{'流通市值(亿)':>12}")
+    print("-" * 44)
+    for _, row in show.iterrows():
+        cap = row["float_mktcap"] / 1e8 if pd.notna(row["float_mktcap"]) else 0
+        print(f"{row['symbol']:<8}{row['name']:<10}"
+              f"{str(row['industry'] or '-'):<12}{cap:>12.0f}")
+    if len(pool) > len(show):
+        print(f"... 其余 {len(pool) - len(show)} 只略")
+
+    # 行业信息顺手合并进行业表
+    if pool["industry"].notna().any():
+        ind = pool.set_index("symbol")["industry"].dropna()
+        names = pool.set_index("symbol")["name"]
+        p = save_industry(ind, names=names)
+        print(f"[universe] 行业表已更新: {p}")
+
+    if not args.fetch:
+        print("\n提示: 加 --fetch 可以顺便下载这些股票的历史行情")
+        return
+
+    symbols = list(pool["symbol"])
+    print(f"\n开始下载 {len(symbols)} 只股票的历史...")
+    ok, failed = [], []
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            df = fetch_stock_daily(symbol=symbol, start_date=args.start,
+                                   end_date=args.end, adjust=args.adjust)
+            save_csv(df, symbol, processed=False)
+            save_csv(add_returns(clean_data(df)), symbol, processed=True)
+            ok.append(symbol)
+        except Exception as e:                   # noqa: BLE001
+            print(f"  [FAIL] {symbol}: {e}")
+            failed.append(symbol)
+        if i % 10 == 0:
+            print(f"  进度 {i}/{len(symbols)}")
+
+    print(f"\n完成: 成功 {len(ok)} 只, 失败 {len(failed)} 只")
+    if ok:
+        print("  下一步: python main.py factor --symbols "
+              + ",".join(ok[:20]) + ("... " if len(ok) > 20 else ""))
+
+
 def cmd_portfolio(args):
     """多标的组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -477,7 +540,7 @@ def cmd_portfolio(args):
 
 def _load_universe(symbols, start, end):
     """把多只股票的 CSV 拼成宽表 (index=日期, columns=代码)"""
-    fields = {"close": {}, "volume": {}, "turnover": {}}
+    fields = {"close": {}, "volume": {}, "turnover": {}, "amount": {}}
     missing = []
 
     for symbol in symbols:
@@ -503,7 +566,8 @@ def _load_universe(symbols, start, end):
     close = pd.DataFrame(fields["close"]).sort_index()
     volume = pd.DataFrame(fields["volume"]).sort_index() if fields["volume"] else None
     turnover = pd.DataFrame(fields["turnover"]).sort_index() if fields["turnover"] else None
-    return close, volume, turnover
+    amount = pd.DataFrame(fields["amount"]).sort_index() if fields["amount"] else None
+    return close, volume, turnover, amount
 
 
 def cmd_factor(args):
@@ -512,7 +576,7 @@ def cmd_factor(args):
     start = pd.to_datetime(args.start)
     end = pd.to_datetime(args.end)
 
-    close, volume, turnover = _load_universe(symbols, start, end)
+    close, volume, turnover, amount = _load_universe(symbols, start, end)
     if close.shape[1] < 5:
         print(f"可用标的只有 {close.shape[1]} 只, IC 分析至少需要 5 只")
         return
@@ -533,6 +597,34 @@ def cmd_factor(args):
 
     fwd = compute_forward_returns(close, periods=args.period)
 
+    # ---------------- 中性化准备（v0.9 Phase 9） ----------------
+    industry = None
+    logcap_s = None
+    if args.neutralize:
+        parts = [p.strip() for p in args.neutralize.split(",") if p.strip()]
+        unknown = [p for p in parts if p not in ("industry", "size")]
+        if unknown:
+            print(f"未知的中性化项: {', '.join(unknown)}（可选 industry,size）")
+            return
+
+        if "industry" in parts:
+            industry = load_industry(args.industry_file)
+            covered = industry.reindex(close.columns).notna().sum()
+            print(f"[中性化] 行业分类: 覆盖 {covered}/{close.shape[1]} 只标的"
+                  f"（{args.industry_file or 'data/meta/industry.csv'}）")
+            if covered == 0:
+                print("[中性化] 行业表为空, 跳过行业中性化")
+                parts.remove("industry")
+
+        if "size" in parts:
+            if amount is None or turnover is None:
+                print("[中性化] 缺成交额/换手率字段, 跳过市值中性化")
+            else:
+                mktcap = float_mktcap(amount, turnover)
+                logcap_s = log_size(mktcap)
+                valid = logcap_s.notna().sum().sum()
+                print(f"[中性化] 市值由 成交额/换手率 反推, 有效格点 {valid}")
+
     results = {}
     qsummaries = {}
     for name, fac in factors.items():
@@ -545,6 +637,41 @@ def cmd_factor(args):
                 qret, holding_period=args.period)
 
     print("\n" + format_ic_report(results, qsummaries))
+
+    # ---------------- 中性化前后对比 ----------------
+    if args.neutralize and (industry is not None or logcap_s is not None):
+        print("\n" + "=" * 62)
+        print("  中性化前后 IC 对比")
+        print("=" * 62)
+        print(f"{'因子':<16}{'原始 IC':>10}{'中性 IC':>10}"
+              f"{'原始市值暴露':>14}{'中性市值暴露':>14}")
+        print("-" * 62)
+
+        for name, fac in factors.items():
+            raw_exp = (size_exposure(fac, logcap_s)
+                       if logcap_s is not None else float("nan"))
+            neu = neutralize_factor(
+                fac, industry=industry, log_mktcap=logcap_s,
+                winsorize=(args.winsor_lower, args.winsor_upper))
+            neu_exp = (size_exposure(neu, logcap_s)
+                       if logcap_s is not None else float("nan"))
+            rn = compute_ic(neu, fwd, method=args.method)
+            print(f"{name:<16}{results[name].mean_ic:>10.4f}"
+                  f"{rn.mean_ic:>10.4f}{raw_exp:>14.0%}{neu_exp:>14.0%}")
+
+        print("-" * 62)
+        print("  市值暴露 = 因子与 ln(流通市值) 的横截面相关系数日均值")
+        print("  中性化后应该接近 0; IC 掉得越多, 说明原来的 IC 越依赖行业/市值")
+
+        if industry is not None:
+            print("\n  中性化后行业暴露（行业内平均 z 值, 应接近 0）:")
+            neu_all = neutralize_factor(
+                factors[next(iter(factors))], industry=industry,
+                log_mktcap=logcap_s,
+                winsorize=(args.winsor_lower, args.winsor_upper))
+            exp = industry_exposure(neu_all, industry)
+            for ind_name, val in exp.items():
+                print(f"    {ind_name:<10}{val:+.3f}")
 
     if args.analyze:
         for name, r in results.items():
@@ -681,8 +808,26 @@ def main():
                        help="分层数量（默认 5，0 表示不分层）")
     p_fa2.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_fa2.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    p_fa2.add_argument("--neutralize", default="",
+                       help="中性化: industry,size (逗号分隔, 默认不做)")
+    p_fa2.add_argument("--industry-file", default=None,
+                       help="行业分类 CSV (默认 data/meta/industry.csv)")
+    p_fa2.add_argument("--winsor-lower", type=float, default=0.01,
+                       help="缩尾下分位 (默认 0.01)")
+    p_fa2.add_argument("--winsor-upper", type=float, default=0.99,
+                       help="缩尾上分位 (默认 0.99)")
     p_fa2.add_argument("--analyze", "-a", action="store_true",
                        help="生成 IC 和分层图表")
+
+    # universe 命令
+    p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
+    p_univ.add_argument("--top", type=int, default=50,
+                        help="取前多少只（默认 50）")
+    p_univ.add_argument("--fetch", action="store_true",
+                        help="顺便下载这些股票的历史行情")
+    p_univ.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_univ.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    p_univ.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", ""])
 
     args = parser.parse_args()
 
@@ -706,6 +851,8 @@ def main():
         cmd_portfolio(args)
     elif args.command == "factor":
         cmd_factor(args)
+    elif args.command == "universe":
+        cmd_universe(args)
     else:
         parser.print_help()
 
