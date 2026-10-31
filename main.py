@@ -417,13 +417,20 @@ def cmd_universe(args):
     path = save_universe(pool)
     print(f"[universe] 已保存: {path} ({len(pool)} 只)")
 
+    by_amount = "rank_by" in pool.columns and (pool["rank_by"] == "amount").any()
     show = pool.head(20)
-    print(f"\n{'代码':<8}{'名称':<10}{'行业':<12}{'流通市值(亿)':>12}")
+    metric = "成交额(亿)" if by_amount else "流通市值(亿)"
+    print(f"\n{'代码':<8}{'名称':<10}{'行业':<12}{metric:>12}")
     print("-" * 44)
     for _, row in show.iterrows():
-        cap = row["float_mktcap"] / 1e8 if pd.notna(row["float_mktcap"]) else 0
+        if by_amount:
+            val = row.get("amount", 0) / 1e8 if pd.notna(row.get("amount")) else 0
+        else:
+            val = row["float_mktcap"] / 1e8 if pd.notna(row["float_mktcap"]) else 0
         print(f"{row['symbol']:<8}{row['name']:<10}"
-              f"{str(row['industry'] or '-'):<12}{cap:>12.0f}")
+              f"{str(row['industry'] or '-'):<12}{val:>12.0f}")
+    if by_amount:
+        print("(东财快照限流，本次按当日成交额排序选池)")
     if len(pool) > len(show):
         print(f"... 其余 {len(pool) - len(show)} 只略")
 
@@ -514,6 +521,9 @@ def cmd_portfolio(args):
     engine = MultiAssetBacktester(
         initial_capital=args.capital,
         rebalance_days=args.rebalance,
+        limit_check=not args.no_limit,
+        max_participation=args.max_participation,
+        align=args.align,
     )
     result = engine.run(
         data, signals,
@@ -787,6 +797,13 @@ def main():
                       help="调仓周期，交易日（默认 5）")
     p_pf.add_argument("--capital", type=float, default=100000,
                       help="初始资金（默认 100000）")
+    p_pf.add_argument("--no-limit", action="store_true",
+                      help="关闭涨跌停成交约束")
+    p_pf.add_argument("--max-participation", type=float, default=0.10,
+                      help="单日最多吃掉成交额的比例（默认 0.10，0=不限制）")
+    p_pf.add_argument("--align", choices=["union", "intersection"],
+                      default="union",
+                      help="日期对齐：union 会保留停牌日（默认），intersection 只取共同交易日")
     p_pf.add_argument("--start", default="20190101",
                       help="起始日期 YYYYMMDD")
     p_pf.add_argument("--end", default="20241231",

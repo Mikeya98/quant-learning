@@ -27,3 +27,6 @@ Thumbs.db
 *.png
 *.jpg
 reports/
+
+# Generated universe snapshot (changes daily)
+data/meta/universe.csv

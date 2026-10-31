@@ -79,6 +79,19 @@ def main():
     kept = filter_universe(df, exclude_st=False)
     check("ST某某" in set(kept["name"]), "exclude_st=False 时保留 ST")
 
+    print("\n── 降级路径: 没有流通市值时按成交额排序 ──")
+    fallback = pd.DataFrame({
+        "symbol": ["600519", "000001", "300750", "830799"],
+        "name": ["贵州茅台", "平安银行", "宁德时代", "北交所某股"],
+        "float_mktcap": [pd.NA, pd.NA, pd.NA, pd.NA],
+        "amount": [8e9, 2e9, 5e9, 1e9],
+    })
+    pool2 = filter_universe(fallback)
+    check(len(pool2) == 3, "仍然过滤北交所")
+    check(pool2["symbol"].tolist() == ["600519", "300750", "000001"],
+          "按成交额降序")
+    check(pool2["amount"].is_monotonic_decreasing, "成交额单调递减")
+
     print("\n── parse_industry ──")
     check(parse_industry({"data": {"f127": "酿酒行业"}}) == "酿酒行业", "取 f127")
     check(parse_industry({"data": {"f127": "-"}}) == "-", "占位符原样返回")

@@ -61,53 +61,95 @@ class MultiAssetBacktester:
         slippage: float = 0.001,
         rebalance_days: int = 5,
         min_weight_change: float = 0.02,
+        limit_check: bool = True,
+        max_participation: float = 0.10,
+        align: str = "union",
     ):
         self.initial_capital = initial_capital
         self.broker = Broker(commission_rate=commission_rate, slippage=slippage)
         self.rebalance_days = max(1, rebalance_days)
         self.min_weight_change = min_weight_change
+        self.limit_check = limit_check
+        self.max_participation = max(0.0, max_participation)
+        self.align = align
+
+    @staticmethod
+    def limit_pct(symbol: str) -> float:
+        """按板块推断涨跌停幅度 (ST 股无法从代码判断, 这里不处理 ±5%)。"""
+        if symbol.startswith(("300", "301", "688")):
+            return 0.20
+        if symbol.startswith(("4", "8")):
+            return 0.30
+        return 0.10
 
     # ------------------------------------------------------------------
     # 数据准备
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _align(
+        self,
         data: Dict[str, pd.DataFrame],
         signals: Dict[str, pd.Series],
     ):
         """把多个标的的收盘价和信号对齐到同一组交易日。
 
         Returns:
-            dates:    DatetimeIndex (所有标的都有数据的日子)
-            prices:   DataFrame, 列=标的, 行=日期
-            sig_panel: DataFrame, 列=标的, 行=日期, 值 0/1
+            dates:      DatetimeIndex (区间内所有交易日)
+            prices:     DataFrame, 列=标的, 行=日期 (停牌日沿用前收)
+            sig_panel:  DataFrame, 列=标的, 行=日期, 值 0/1
+            tradable:   DataFrame, 列=标的, 行=日期, True=当天有成交
+            amount:     DataFrame, 成交额 (缺失时为 NaN)
+
+        对齐方式:
+            union  —— 取所有标的日期并集, 只保留"所有标的都已上市"的区间。
+                      某只标的当天没有数据 = 停牌, tradable=False。
+            intersection —— 只取所有标的都有数据的日子 (旧行为, 看不到停牌)。
         """
         if not data:
             raise ValueError("data 为空")
 
         price_series = {}
         sig_series = {}
+        amount_series = {}
+        tradable_series = {}
 
         for symbol, df in data.items():
             if "date" not in df.columns or "close" not in df.columns:
                 raise ValueError(f"{symbol} 缺少 date/close 列")
 
-            s = df.set_index("date")["close"].sort_index()
-            price_series[symbol] = s
+            work = df.copy()
+            if "volume" not in work.columns:
+                work["volume"] = 1.0
+            if "amount" not in work.columns:
+                work["amount"] = np.nan
+
+            work = work.set_index("date").sort_index()
+            price_series[symbol] = work["close"]
+            amount_series[symbol] = work["amount"].astype(float)
+
+            # 有这一行且成交量大于 0 才算可交易; 停牌日通常没有行
+            tradable_series[symbol] = (
+                (work["volume"].astype(float) > 0) & work["close"].notna()
+            )
 
             sig = signals.get(symbol)
             if sig is None:
                 raise ValueError(f"{symbol} 没有对应信号")
 
             # 策略返回的 signal 是 RangeIndex, 转成日期索引再对齐
-            sig = pd.Series(np.asarray(sig), index=s.index).astype(int)
+            sig = pd.Series(np.asarray(sig), index=price_series[symbol].index).astype(int)
             sig_series[symbol] = sig
 
-        dates = None
-        for s in price_series.values():
-            dates = s.index if dates is None else dates.intersection(s.index)
-        dates = dates.sort_values()
+        if self.align == "intersection":
+            dates = None
+            for s in price_series.values():
+                dates = s.index if dates is None else dates.intersection(s.index)
+            dates = dates.sort_values()
+        else:
+            first = max(s.index.min() for s in price_series.values())
+            last = min(s.index.max() for s in price_series.values())
+            all_dates = sorted(set().union(*[set(s.index) for s in price_series.values()]))
+            dates = pd.DatetimeIndex([d for d in all_dates if first <= d <= last])
 
         if len(dates) == 0:
             raise ValueError("各标的数据没有重叠的交易日")
@@ -117,13 +159,23 @@ class MultiAssetBacktester:
             index=dates,
         ).ffill()
 
+        tradable = pd.DataFrame(
+            {sym: t.reindex(dates).fillna(False) for sym, t in tradable_series.items()},
+            index=dates,
+        ).astype(bool)
+
+        amount = pd.DataFrame(
+            {sym: a.reindex(dates) for sym, a in amount_series.items()},
+            index=dates,
+        )
+
         sig_panel = pd.DataFrame(
             {sym: s.reindex(dates).ffill().fillna(0).astype(int)
              for sym, s in sig_series.items()},
             index=dates,
         )
 
-        return dates, prices, sig_panel
+        return dates, prices, sig_panel, tradable, amount
 
     # ------------------------------------------------------------------
     # 目标权重
@@ -138,16 +190,29 @@ class MultiAssetBacktester:
         alloc: str,
         top_n: int,
         momentum_window: int,
+        tradable: pd.DataFrame,
     ) -> Dict[str, float]:
-        """计算第 i 个交易日的目标权重 (权重和 <= 1, 剩余为现金)"""
-        active = [s for s in symbols if sig_panel[s].iloc[i] == 1]
+        """计算第 i 个交易日的目标权重 (权重和 <= 1, 剩余为现金)
+
+        停牌或当天没有价格的标的不进入目标组合; 已经持有的停牌股
+        会在执行阶段因为不可交易而继续留在账上。
+        """
+        active = [
+            s for s in symbols
+            if sig_panel[s].iloc[i] == 1
+            and bool(tradable[s].iloc[i])
+            and pd.notna(prices[s].iloc[i])
+        ]
 
         if alloc == "momentum" and len(active) > 1 and momentum_window > 1:
             if i >= momentum_window:
                 scores = {
                     s: prices[s].iloc[i] / prices[s].iloc[i - momentum_window] - 1
                     for s in active
+                    if pd.notna(prices[s].iloc[i - momentum_window])
+                    and prices[s].iloc[i - momentum_window] > 0
                 }
+                active = [s for s in active if s in scores]
                 active = sorted(active, key=lambda s: scores[s], reverse=True)
             if top_n > 0:
                 active = active[:top_n]
@@ -171,8 +236,18 @@ class MultiAssetBacktester:
         momentum_window: int = 20,
         strategy_name: str = "",
     ) -> PortfolioResult:
-        dates, prices, sig_panel = self._align(data, signals)
+        dates, prices, sig_panel, tradable, amount = self._align(data, signals)
         symbols = list(prices.columns)
+
+        # 涨跌停判断用: 相对前一日收盘的涨跌幅
+        pct = prices.pct_change()
+        limit_up_panel = pd.DataFrame(False, index=dates, columns=symbols)
+        limit_down_panel = pd.DataFrame(False, index=dates, columns=symbols)
+        if self.limit_check and len(prices) > 1:
+            for s in symbols:
+                lim = self.limit_pct(s) - 1e-3     # 价格按 0.01 取整, 留一点容差
+                limit_up_panel[s] = pct[s] >= lim
+                limit_down_panel[s] = pct[s] <= -lim
 
         cash = self.initial_capital
         shares = {s: 0 for s in symbols}
@@ -186,6 +261,9 @@ class MultiAssetBacktester:
         prev_target_set = set()
         n_rebalances = 0
         traded_notional = 0.0
+        blocked_limit = 0
+        blocked_suspension = 0
+        blocked_liquidity = 0
 
         for i, date in enumerate(dates):
             px = prices.iloc[i]
@@ -198,6 +276,7 @@ class MultiAssetBacktester:
             targets = self._target_weights(
                 i, symbols, prices, sig_panel,
                 alloc=alloc, top_n=top_n, momentum_window=momentum_window,
+                tradable=tradable,
             )
             target_set = set(targets)
 
@@ -228,12 +307,30 @@ class MultiAssetBacktester:
                         continue
                     if buy_date[s] == date:
                         continue                      # 今天买的, T+1 不能卖
+                    if not bool(tradable[s].iloc[i]):
+                        blocked_suspension += 1       # 停牌, 卖不出去
+                        continue
+                    if bool(limit_down_panel[s].iloc[i]):
+                        blocked_limit += 1            # 跌停, 没有买盘
+                        continue
 
                     sell_shares = int(delta / (px[s] * (1 - self.broker.slippage)))
                     sell_shares = min(sell_shares, shares[s])
                     sell_shares = (sell_shares // self.broker.lot_size) * self.broker.lot_size
                     if sell_shares <= 0:
                         continue
+
+                    # 流动性约束: 单日最多吃掉成交额的一部分
+                    if (self.max_participation > 0
+                            and pd.notna(amount[s].iloc[i])
+                            and amount[s].iloc[i] > 0):
+                        cap = int(amount[s].iloc[i] * self.max_participation
+                                  / px[s] // self.broker.lot_size) * self.broker.lot_size
+                        if sell_shares > cap:
+                            sell_shares = cap
+                            blocked_liquidity += 1
+                        if sell_shares <= 0:
+                            continue
 
                     fill = self.broker.execute_sell(px[s], sell_shares)
                     cash += fill.net_amount
@@ -256,9 +353,25 @@ class MultiAssetBacktester:
                     delta = tgt_val - cur_val
                     if delta <= threshold or cash <= 0:
                         continue
+                    if not bool(tradable[s].iloc[i]):
+                        blocked_suspension += 1       # 停牌, 买不进来
+                        continue
+                    if bool(limit_up_panel[s].iloc[i]):
+                        blocked_limit += 1            # 涨停, 没有卖盘
+                        continue
 
                     budget = min(delta, cash)
                     buy_shares = self.broker.calc_shares(budget, px[s], 1.0)
+
+                    # 流动性约束: 单日最多吃掉成交额的一部分
+                    if (self.max_participation > 0
+                            and pd.notna(amount[s].iloc[i])
+                            and amount[s].iloc[i] > 0):
+                        cap = int(amount[s].iloc[i] * self.max_participation
+                                  / px[s] // self.broker.lot_size) * self.broker.lot_size
+                        if buy_shares > cap:
+                            buy_shares = cap
+                            blocked_liquidity += 1
                     if buy_shares <= 0:
                         continue
 
@@ -338,6 +451,9 @@ class MultiAssetBacktester:
             n_rebalances=n_rebalances,
             n_trades=len(trades),
             traded_notional=traded_notional,
+            blocked_limit=blocked_limit,
+            blocked_suspension=blocked_suspension,
+            blocked_liquidity=blocked_liquidity,
         )
 
         config = {
@@ -348,6 +464,9 @@ class MultiAssetBacktester:
             "momentum_window": momentum_window,
             "rebalance_days": self.rebalance_days,
             "initial_capital": self.initial_capital,
+            "limit_check": self.limit_check,
+            "max_participation": self.max_participation,
+            "align": self.align,
         }
 
         return PortfolioResult(
@@ -372,6 +491,9 @@ class MultiAssetBacktester:
         n_rebalances: int,
         n_trades: int,
         traded_notional: float,
+        blocked_limit: int = 0,
+        blocked_suspension: int = 0,
+        blocked_liquidity: int = 0,
     ) -> dict:
         from ..analysis.metrics import (
             annualized_return,
@@ -415,6 +537,9 @@ class MultiAssetBacktester:
             "n_rebalances": n_rebalances,
             "n_trades": n_trades,
             "turnover_x": round(traded_notional / equity.mean(), 2),
+            "blocked_limit": blocked_limit,
+            "blocked_suspension": blocked_suspension,
+            "blocked_liquidity": blocked_liquidity,
         }
 
 
@@ -433,6 +558,12 @@ def format_report(result: PortfolioResult) -> str:
     lines.append(f"  分配规则:   {cfg['alloc']}"
                  + (f" (top {cfg['top_n']})" if cfg['alloc'] == 'momentum' else ""))
     lines.append(f"  调仓周期:   {cfg['rebalance_days']} 个交易日")
+    lines.append(
+        "  成交约束:   "
+        + ("涨跌停检查开" if cfg.get("limit_check", True) else "涨跌停检查关")
+        + f"，单日成交额上限 {cfg.get('max_participation', 0.1):.0%}"
+        + ("，停牌不成交" if cfg.get("align") == "union" else "")
+    )
     lines.append("")
     lines.append(f"  初始资金:   {s['initial_capital']:>14,.2f}")
     lines.append(f"  最终净值:   {s['final_equity']:>14,.2f}")
@@ -450,6 +581,11 @@ def format_report(result: PortfolioResult) -> str:
     lines.append(f"  调仓次数:   {s['n_rebalances']}")
     lines.append(f"  成交笔数:   {s['n_trades']}")
     lines.append(f"  换手倍数:   {s['turnover_x']:.2f}x (累计成交额 / 平均净值)")
+    lines.append(
+        f"  被拦下的交易: 涨跌停 {s.get('blocked_limit', 0)} 次 / "
+        f"停牌 {s.get('blocked_suspension', 0)} 次 / "
+        f"流动性 {s.get('blocked_liquidity', 0)} 次"
+    )
 
     lines.append("")
     lines.append("-" * 62)

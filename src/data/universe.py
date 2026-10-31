@@ -74,7 +74,11 @@ def parse_snapshot(payload: dict) -> pd.DataFrame:
 
 
 def filter_universe(df: pd.DataFrame, exclude_st: bool = True) -> pd.DataFrame:
-    """去掉 ST / 退市 / 北交所，并按流通市值降序"""
+    """去掉 ST / 退市 / 北交所。
+
+    有流通市值时按流通市值降序; 只有成交额时 (东财快照被限流的降级
+    路径) 按当日成交额降序 —— 流动性好的股票同样适合做组合回测。
+    """
     out = df.copy()
 
     if exclude_st:
@@ -84,8 +88,18 @@ def filter_universe(df: pd.DataFrame, exclude_st: bool = True) -> pd.DataFrame:
     # 北交所代码 8 开头、4 开头
     out = out[~out["symbol"].str.startswith(("4", "8"))]
 
-    out = out.dropna(subset=["float_mktcap"])
-    out = out.sort_values("float_mktcap", ascending=False)
+    if "float_mktcap" not in out.columns:
+        out["float_mktcap"] = pd.NA
+
+    if out["float_mktcap"].notna().any():
+        out = out.dropna(subset=["float_mktcap"])
+        out = out.sort_values("float_mktcap", ascending=False)
+    elif "amount" in out.columns:
+        out = out.dropna(subset=["amount"])
+        out = out.sort_values("amount", ascending=False)
+    else:
+        out = out.dropna(subset=["float_mktcap"])
+
     return out.reset_index(drop=True)
 
 
@@ -151,6 +165,30 @@ def fetch_snapshot(page_size: int = 100, max_pages: int = 60) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def fetch_sina_snapshot(progress=print) -> pd.DataFrame:
+    """降级快照: 新浪全市场行情。
+
+    东财 clist 接口限流时用它兜底。新浪没有流通市值字段, 用当日
+    成交额做流动性排序; 后续补行业仍然走东财 stock/get (两个接口
+    独立限流, 通常一个被封另一个还能用)。
+    """
+    import akshare as ak
+
+    progress("[universe] 东财快照不可用，降级到新浪 spot ...")
+    df = ak.stock_zh_a_spot()
+    if df is None or len(df) == 0:
+        raise RuntimeError("新浪快照也为空")
+
+    work = df.copy()
+    work["symbol"] = (
+        work["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.zfill(6)
+    )
+    work["name"] = work["名称"].astype(str)
+    work["amount"] = pd.to_numeric(work.get("成交额"), errors="coerce")
+    work["float_mktcap"] = pd.NA
+    return work[["symbol", "name", "float_mktcap", "amount"]]
+
+
 def fetch_industry(symbol: str, retries: int = 2) -> Optional[str]:
     """单只股票的行业（东方财富的行业分类，约 86 个二级行业）"""
     symbol = str(symbol).zfill(6)
@@ -176,13 +214,24 @@ def build_universe(top_n: int = 50, exclude_st: bool = True,
     -------
     DataFrame: symbol, name, industry, float_mktcap
     """
-    snapshot = fetch_snapshot()
+    try:
+        snapshot = fetch_snapshot()
+    except Exception as exc:          # noqa: BLE001
+        progress(f"[universe] 东财快照失败: {exc}")
+        snapshot = fetch_sina_snapshot(progress=progress)
     if snapshot.empty:
         raise RuntimeError("快照为空，接口可能被限流了")
 
     pool = filter_universe(snapshot, exclude_st=exclude_st).head(top_n)
-    pool = pool[["symbol", "name", "float_mktcap"]].copy()
+    cols = ["symbol", "name", "float_mktcap"]
+    if "amount" in pool.columns:
+        cols.append("amount")
+    pool = pool[cols].copy()
     pool["industry"] = None
+    if pool["float_mktcap"].notna().any():
+        pool["rank_by"] = "float_mktcap"
+    else:
+        pool["rank_by"] = "amount"
 
     if with_industry:
         for i, sym in enumerate(pool["symbol"]):
