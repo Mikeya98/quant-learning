@@ -801,6 +801,9 @@ def main():
                       help="关闭涨跌停成交约束")
     p_pf.add_argument("--max-participation", type=float, default=0.10,
                       help="单日最多吃掉成交额的比例（默认 0.10，0=不限制）")
+    p_pf.add_argument("--exec", dest="exec_mode", choices=["close", "next_open"],
+                      default="close", help="成交价：当日收盘 / 次日开盘")
+    p_pf.add_argument("--st-file", help="ST 股票代码文件（一行一个，用于 ±5%% 涨跌停）")
     p_pf.add_argument("--align", choices=["union", "intersection"],
                       default="union",
                       help="日期对齐：union 会保留停牌日（默认），intersection 只取共同交易日")

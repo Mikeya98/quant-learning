@@ -218,6 +218,70 @@ def test_liquidity_cap():
           "no cap → much larger position")
 
 
+def test_next_open_execution():
+    print("\n== 次日开盘成交 ==")
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    data = {
+        "A": pd.DataFrame({
+            "date": dates,
+            "open": [10.0, 10.5, 10.5, 10.5],
+            "close": [10.0, 10.5, 10.5, 10.5],
+            "volume": [1e6] * 4,
+            "amount": [1e9] * 4,
+        }),
+    }
+    sig = pd.Series([1, 0, 0, 0])
+    bt = MultiAssetBacktester(initial_capital=100000, rebalance_days=1,
+                              exec_mode="next_open")
+    r = bt.run(data, {"A": sig})
+    buys = r.trades_df[r.trades_df["side"] == "BUY"]
+    check(len(buys) > 0, "next_open makes a trade")
+    if len(buys):
+        check(abs(buys.iloc[0]["price"] - 10.5 * 1.001) < 0.02,
+              "buy price = next open + slippage")
+        check(buys.iloc[0]["date"] == dates[1], "buy shifted to next trading day")
+
+
+def test_st_limit_down():
+    print("\n== ST ±5% 跌停拦截 ==")
+    dates = pd.bdate_range("2020-01-01", periods=3)
+    data = {
+        "600000": pd.DataFrame({
+            "date": dates,
+            "open": [10.0, 9.4, 9.4],
+            "close": [10.0, 9.4, 9.4],
+            "volume": [1e6] * 3,
+            "amount": [1e9] * 3,
+        }),
+    }
+    sig = pd.Series([1, 0, 0])
+
+    st = MultiAssetBacktester(initial_capital=100000, rebalance_days=1,
+                              st_symbols={"600000"})
+    r = st.run(data, {"600000": sig})
+    check(r.summary["blocked_limit"] >= 1, "ST -6% is limit-down, sell blocked")
+
+    normal = MultiAssetBacktester(initial_capital=100000, rebalance_days=1)
+    r2 = normal.run(data, {"600000": sig})
+    check(r2.summary["blocked_limit"] == 0, "non-ST -6% allows sell")
+
+
+def test_st_helpers():
+    print("\n== ST 名称与涨跌停幅度 ==")
+    from src.data.st import is_st_name, st_symbols_from_names
+    check(is_st_name("*ST海航") and is_st_name("ST康美") and
+          is_st_name("S*ST前锋"), "ST name detection")
+    check(not is_st_name("贵州茅台"), "normal name is not ST")
+    check(st_symbols_from_names({"600000": "*ST海航", "600519": "贵州茅台"})
+          == {"600000"}, "symbol set from names")
+    check(MultiAssetBacktester.limit_pct("600000", True) == 0.05,
+          "main board ST ±5%")
+    check(MultiAssetBacktester.limit_pct("300001", True) == 0.20,
+          "ChiNext ST keeps ±20%")
+    check(MultiAssetBacktester.limit_pct("830001", True) == 0.30,
+          "BSE stays ±30%")
+
+
 def main():
     test_all_cash()
     test_equal_weight_uptrend()
@@ -227,6 +291,9 @@ def main():
     test_limit_down_blocks_sell()
     test_suspension_blocks_trade()
     test_liquidity_cap()
+    test_next_open_execution()
+    test_st_limit_down()
+    test_st_helpers()
 
     print(f"\n{'=' * 40}")
     print(f"  {PASS} passed, {FAIL} failed")

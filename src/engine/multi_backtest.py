@@ -64,6 +64,8 @@ class MultiAssetBacktester:
         limit_check: bool = True,
         max_participation: float = 0.10,
         align: str = "union",
+        exec_mode: str = "close",
+        st_symbols=None,
     ):
         self.initial_capital = initial_capital
         self.broker = Broker(commission_rate=commission_rate, slippage=slippage)
@@ -72,15 +74,24 @@ class MultiAssetBacktester:
         self.limit_check = limit_check
         self.max_participation = max(0.0, max_participation)
         self.align = align
+        if exec_mode not in ("close", "next_open"):
+            raise ValueError("exec_mode 只能是 close 或 next_open")
+        self.exec_mode = exec_mode
+        # ST 股名单（代码集合）；为空时按普通股票处理
+        self.st_symbols = set(st_symbols or ())
 
     @staticmethod
-    def limit_pct(symbol: str) -> float:
-        """按板块推断涨跌停幅度 (ST 股无法从代码判断, 这里不处理 ±5%)。"""
+    def limit_pct(symbol: str, is_st: bool = False) -> float:
+        """按板块和 ST 状态推断涨跌停幅度。
+
+        主板 ST 为 ±5%；创业板/科创板 ST 仍是 ±20%；北交所 ±30%。
+        历史 ST 状态会变化，回测里由调用方给出 st_symbols，拿不到就按普通股处理。
+        """
         if symbol.startswith(("300", "301", "688")):
             return 0.20
         if symbol.startswith(("4", "8")):
             return 0.30
-        return 0.10
+        return 0.05 if is_st else 0.10
 
     # ------------------------------------------------------------------
     # 数据准备
@@ -109,6 +120,7 @@ class MultiAssetBacktester:
             raise ValueError("data 为空")
 
         price_series = {}
+        open_series = {}
         sig_series = {}
         amount_series = {}
         tradable_series = {}
@@ -123,8 +135,11 @@ class MultiAssetBacktester:
             if "amount" not in work.columns:
                 work["amount"] = np.nan
 
+            if "open" not in work.columns:
+                work["open"] = work["close"]
             work = work.set_index("date").sort_index()
             price_series[symbol] = work["close"]
+            open_series[symbol] = work["open"]
             amount_series[symbol] = work["amount"].astype(float)
 
             # 有这一行且成交量大于 0 才算可交易; 停牌日通常没有行
@@ -159,6 +174,11 @@ class MultiAssetBacktester:
             index=dates,
         ).ffill()
 
+        opens = pd.DataFrame(
+            {sym: s.reindex(dates) for sym, s in open_series.items()},
+            index=dates,
+        ).ffill()
+
         tradable = pd.DataFrame(
             {sym: t.reindex(dates).fillna(False) for sym, t in tradable_series.items()},
             index=dates,
@@ -175,7 +195,7 @@ class MultiAssetBacktester:
             index=dates,
         )
 
-        return dates, prices, sig_panel, tradable, amount
+        return dates, prices, opens, sig_panel, tradable, amount
 
     # ------------------------------------------------------------------
     # 目标权重
@@ -191,26 +211,32 @@ class MultiAssetBacktester:
         top_n: int,
         momentum_window: int,
         tradable: pd.DataFrame,
+        sig_idx: int = None,
+        exec_prices: pd.DataFrame = None,
     ) -> Dict[str, float]:
         """计算第 i 个交易日的目标权重 (权重和 <= 1, 剩余为现金)
 
-        停牌或当天没有价格的标的不进入目标组合; 已经持有的停牌股
-        会在执行阶段因为不可交易而继续留在账上。
+        sig_idx 是信号所在行：收盘成交模式等于 i；次日开盘模式是 i-1。
+        exec_prices 是实际成交价面板（收盘价或开盘价），用于判断当天
+        能不能买到。停牌或当天没有价格的标的不进入目标组合。
         """
+        sig_idx = i if sig_idx is None else sig_idx
+        exec_prices = prices if exec_prices is None else exec_prices
+
         active = [
             s for s in symbols
-            if sig_panel[s].iloc[i] == 1
+            if sig_panel[s].iloc[sig_idx] == 1
             and bool(tradable[s].iloc[i])
-            and pd.notna(prices[s].iloc[i])
+            and pd.notna(exec_prices[s].iloc[i])
         ]
 
         if alloc == "momentum" and len(active) > 1 and momentum_window > 1:
-            if i >= momentum_window:
+            if sig_idx >= momentum_window:
                 scores = {
-                    s: prices[s].iloc[i] / prices[s].iloc[i - momentum_window] - 1
+                    s: prices[s].iloc[sig_idx] / prices[s].iloc[sig_idx - momentum_window] - 1
                     for s in active
-                    if pd.notna(prices[s].iloc[i - momentum_window])
-                    and prices[s].iloc[i - momentum_window] > 0
+                    if pd.notna(prices[s].iloc[sig_idx - momentum_window])
+                    and prices[s].iloc[sig_idx - momentum_window] > 0
                 }
                 active = [s for s in active if s in scores]
                 active = sorted(active, key=lambda s: scores[s], reverse=True)
@@ -236,16 +262,19 @@ class MultiAssetBacktester:
         momentum_window: int = 20,
         strategy_name: str = "",
     ) -> PortfolioResult:
-        dates, prices, sig_panel, tradable, amount = self._align(data, signals)
+        dates, prices, opens, sig_panel, tradable, amount = self._align(data, signals)
         symbols = list(prices.columns)
 
-        # 涨跌停判断用: 相对前一日收盘的涨跌幅
-        pct = prices.pct_change()
+        # 涨跌停判断: 收盘模式看收盘价相对前收; 次日开盘模式看开盘价相对前收
+        if self.exec_mode == "next_open":
+            pct = opens / prices.shift(1) - 1
+        else:
+            pct = prices.pct_change()
         limit_up_panel = pd.DataFrame(False, index=dates, columns=symbols)
         limit_down_panel = pd.DataFrame(False, index=dates, columns=symbols)
         if self.limit_check and len(prices) > 1:
             for s in symbols:
-                lim = self.limit_pct(s) - 1e-3     # 价格按 0.01 取整, 留一点容差
+                lim = self.limit_pct(s, s in self.st_symbols) - 1e-3
                 limit_up_panel[s] = pct[s] >= lim
                 limit_down_panel[s] = pct[s] <= -lim
 
@@ -265,36 +294,55 @@ class MultiAssetBacktester:
         blocked_suspension = 0
         blocked_liquidity = 0
 
+        first_trade_day = 1 if self.exec_mode == "next_open" else 0
+
         for i, date in enumerate(dates):
             px = prices.iloc[i]
+            epx = opens.iloc[i] if self.exec_mode == "next_open" else px
+            sig_idx = i - 1 if self.exec_mode == "next_open" else i
 
             # ---- 1. 用当日收盘价估值 ----
             position_value = sum(shares[s] * px[s] for s in symbols)
             equity = cash + position_value
 
             # ---- 2. 目标权重 ----
-            targets = self._target_weights(
-                i, symbols, prices, sig_panel,
-                alloc=alloc, top_n=top_n, momentum_window=momentum_window,
-                tradable=tradable,
-            )
+            if self.exec_mode == "next_open" and i == 0:
+                targets = {}
+            else:
+                targets = self._target_weights(
+                    i, symbols, prices, sig_panel,
+                    alloc=alloc, top_n=top_n, momentum_window=momentum_window,
+                    tradable=tradable,
+                    sig_idx=sig_idx,
+                    exec_prices=opens if self.exec_mode == "next_open" else prices,
+                )
             target_set = set(targets)
 
             # 定期调仓, 或者持仓集合发生变化时立即调仓
             should_rebalance = (
-                i == 0
-                or i % self.rebalance_days == 0
+                i == first_trade_day
+                or (i >= first_trade_day and i % self.rebalance_days == 0)
                 or target_set != prev_target_set
             )
 
-            if should_rebalance and equity > 0:
+            # 次日开盘成交时，调仓规模用"开盘价"估值的组合净值。
+            # 开盘价是成交时刻已知的，不算未来信息；用当天收盘价才是
+            # 提前知道了当天结果。
+            if self.exec_mode == "next_open" and i > 0:
+                sizing_equity = cash + sum(
+                    shares[s] * opens[s].iloc[i] for s in symbols
+                )
+            else:
+                sizing_equity = equity
+
+            if should_rebalance and sizing_equity > 0:
                 n_rebalances += 1
-                target_value = {s: equity * w for s, w in targets.items()}
-                threshold = self.min_weight_change * equity
+                target_value = {s: sizing_equity * w for s, w in targets.items()}
+                threshold = self.min_weight_change * sizing_equity
 
                 # ---- 3a. 先卖: 释放现金, 同时满足 T+1 ----
                 for s in symbols:
-                    cur_val = shares[s] * px[s]
+                    cur_val = shares[s] * epx[s]
                     tgt_val = target_value.get(s, 0.0)
                     delta = cur_val - tgt_val
                     exiting = s not in target_value
@@ -314,7 +362,7 @@ class MultiAssetBacktester:
                         blocked_limit += 1            # 跌停, 没有买盘
                         continue
 
-                    sell_shares = int(delta / (px[s] * (1 - self.broker.slippage)))
+                    sell_shares = int(delta / (epx[s] * (1 - self.broker.slippage)))
                     sell_shares = min(sell_shares, shares[s])
                     sell_shares = (sell_shares // self.broker.lot_size) * self.broker.lot_size
                     if sell_shares <= 0:
@@ -325,14 +373,14 @@ class MultiAssetBacktester:
                             and pd.notna(amount[s].iloc[i])
                             and amount[s].iloc[i] > 0):
                         cap = int(amount[s].iloc[i] * self.max_participation
-                                  / px[s] // self.broker.lot_size) * self.broker.lot_size
+                                  / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if sell_shares > cap:
                             sell_shares = cap
                             blocked_liquidity += 1
                         if sell_shares <= 0:
                             continue
 
-                    fill = self.broker.execute_sell(px[s], sell_shares)
+                    fill = self.broker.execute_sell(epx[s], sell_shares)
                     cash += fill.net_amount
                     shares[s] -= sell_shares
                     flow[s] += fill.net_amount
@@ -349,7 +397,7 @@ class MultiAssetBacktester:
 
                 # ---- 3b. 再买: 用可用现金补到目标权重 ----
                 for s, tgt_val in target_value.items():
-                    cur_val = shares[s] * px[s]
+                    cur_val = shares[s] * epx[s]
                     delta = tgt_val - cur_val
                     if delta <= threshold or cash <= 0:
                         continue
@@ -361,21 +409,21 @@ class MultiAssetBacktester:
                         continue
 
                     budget = min(delta, cash)
-                    buy_shares = self.broker.calc_shares(budget, px[s], 1.0)
+                    buy_shares = self.broker.calc_shares(budget, epx[s], 1.0)
 
                     # 流动性约束: 单日最多吃掉成交额的一部分
                     if (self.max_participation > 0
                             and pd.notna(amount[s].iloc[i])
                             and amount[s].iloc[i] > 0):
                         cap = int(amount[s].iloc[i] * self.max_participation
-                                  / px[s] // self.broker.lot_size) * self.broker.lot_size
+                                  / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if buy_shares > cap:
                             buy_shares = cap
                             blocked_liquidity += 1
                     if buy_shares <= 0:
                         continue
 
-                    fill = self.broker.execute_buy(px[s], buy_shares)
+                    fill = self.broker.execute_buy(epx[s], buy_shares)
                     if fill.net_amount > cash:
                         continue                      # 资金不够 (最低佣金导致)
 
@@ -466,6 +514,8 @@ class MultiAssetBacktester:
             "initial_capital": self.initial_capital,
             "limit_check": self.limit_check,
             "max_participation": self.max_participation,
+            "exec_mode": self.exec_mode,
+            "st_symbols": len(self.st_symbols),
             "align": self.align,
         }
 
@@ -558,6 +608,8 @@ def format_report(result: PortfolioResult) -> str:
     lines.append(f"  分配规则:   {cfg['alloc']}"
                  + (f" (top {cfg['top_n']})" if cfg['alloc'] == 'momentum' else ""))
     lines.append(f"  调仓周期:   {cfg['rebalance_days']} 个交易日")
+    lines.append(f"  成交价:     {'次日开盘' if cfg.get('exec_mode') == 'next_open' else '当日收盘'}"
+                 + (f"，ST 名单 {cfg['st_symbols']} 只" if cfg.get('st_symbols') else ""))
     lines.append(
         "  成交约束:   "
         + ("涨跌停检查开" if cfg.get("limit_check", True) else "涨跌停检查关")
