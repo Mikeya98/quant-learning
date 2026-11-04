@@ -515,8 +515,18 @@ def cmd_portfolio(args):
 
     strategy_name = strategy_cls(**params).describe()
 
+    exec_label = "次日开盘" if args.exec_mode == "next_open" else "当日收盘"
     print(f"\n组合回测: {len(data)} 只标的, {strategy_name}")
-    print(f"区间: {args.start} ~ {args.end}, 调仓周期: {args.rebalance} 日")
+    print(f"区间: {args.start} ~ {args.end}, 调仓周期: {args.rebalance} 日, "
+          f"成交价: {exec_label}")
+
+    # ST 名单从文件读；--exec / --st-file 以前只加到了参数表，没有传进
+    # 回测器，命令行实际一直按默认的收盘成交跑。
+    st_symbols = set()
+    if args.st_file:
+        from src.data import st_symbols_from_file
+        st_symbols = st_symbols_from_file(args.st_file)
+        print(f"ST 名单: {len(st_symbols)} 只 ({args.st_file})")
 
     engine = MultiAssetBacktester(
         initial_capital=args.capital,
@@ -524,6 +534,8 @@ def cmd_portfolio(args):
         limit_check=not args.no_limit,
         max_participation=args.max_participation,
         align=args.align,
+        exec_mode=args.exec_mode,
+        st_symbols=st_symbols,
     )
     result = engine.run(
         data, signals,
@@ -546,6 +558,8 @@ def cmd_portfolio(args):
         path = plot_correlation(result)
         if path:
             print(f"  图表已保存: {path}")
+
+    return result
 
 
 def _load_universe(symbols, start, end):
@@ -694,7 +708,8 @@ def cmd_factor(args):
 
 
 
-def main():
+def build_parser():
+    """构造命令行解析器（独立出来，便于测试 CLI 参数到回测器的传递）。"""
     parser = argparse.ArgumentParser(
         description="Quant Learning - 迷你A股回测框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -849,6 +864,11 @@ def main():
     p_univ.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
     p_univ.add_argument("--adjust", default="qfq", choices=["qfq", "hfq", ""])
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "fetch":

@@ -242,6 +242,58 @@ def test_next_open_execution():
         check(buys.iloc[0]["date"] == dates[1], "buy shifted to next trading day")
 
 
+def test_limit_price_rounding():
+    print("\n== 涨跌停价按 0.01 取整 ==")
+    dates = pd.bdate_range("2020-01-01", periods=4)
+    # 前收 1.04，主板 +10% 理论价 1.144，四舍五入后涨停价是 1.14。
+    # 1.14 的实际涨幅只有 +9.62%，旧的“涨幅 >= 9.9%”判断会漏掉。
+    data = make_data_ohlcv({
+        "A": [(dates[0], 1.04), (dates[1], 1.14),
+              (dates[2], 1.14), (dates[3], 1.14)],
+    })
+    sig = pd.Series([0, 1, 1, 1])
+    bt = MultiAssetBacktester(initial_capital=100000, rebalance_days=1)
+    r = bt.run(data, {"A": sig})
+    days = r.trades_df["date"] if len(r.trades_df) else pd.Series(dtype="datetime64[ns]")
+    check(dates[1] not in set(days), "1.14 is rounded limit-up, buy blocked")
+    check(r.summary["blocked_limit"] >= 1, "rounded limit counted")
+
+    # 1.13 低于取整后的涨停价，应该允许买入
+    data2 = make_data_ohlcv({
+        "A": [(dates[0], 1.04), (dates[1], 1.13),
+              (dates[2], 1.13), (dates[3], 1.13)],
+    })
+    r2 = MultiAssetBacktester(initial_capital=100000,
+                              rebalance_days=1).run(data2, {"A": sig})
+    check(r2.summary["n_trades"] > 0, "1.13 below rounded limit-up, buy allowed")
+
+
+def test_next_open_liquidity_uses_prev_amount():
+    print("\n== 次日开盘的流动性上限用前一日成交额 ==")
+    dates = pd.bdate_range("2020-01-01", periods=3)
+    data = {
+        "A": pd.DataFrame({
+            "date": dates,
+            "open": [1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0],
+            "volume": [1e6] * 3,
+            # 第一天成交额很小，第二天很大。次日开盘买入发生在第二天
+            # 开盘，只能参考第一天已经发生的成交额。
+            "amount": [10000.0, 1e9, 1e9],
+        }),
+    }
+    sig = pd.Series([1, 0, 0])
+    bt = MultiAssetBacktester(initial_capital=100000, rebalance_days=1,
+                              max_participation=0.10, exec_mode="next_open")
+    r = bt.run(data, {"A": sig})
+    buys = r.trades_df[r.trades_df["side"] == "BUY"]
+    check(len(buys) > 0, "next_open buy happened")
+    if len(buys):
+        check(buys.iloc[0]["shares"] <= 1000,
+              "cap uses previous day's amount (1000 shares)")
+        check(r.summary["blocked_liquidity"] >= 1, "liquidity cap counted")
+
+
 def test_st_limit_down():
     print("\n== ST ±5% 跌停拦截 ==")
     dates = pd.bdate_range("2020-01-01", periods=3)
@@ -292,6 +344,8 @@ def main():
     test_suspension_blocks_trade()
     test_liquidity_cap()
     test_next_open_execution()
+    test_limit_price_rounding()
+    test_next_open_liquidity_uses_prev_amount()
     test_st_limit_down()
     test_st_helpers()
 

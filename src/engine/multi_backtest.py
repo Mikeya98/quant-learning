@@ -81,6 +81,30 @@ class MultiAssetBacktester:
         self.st_symbols = set(st_symbols or ())
 
     @staticmethod
+    def limit_prices(prev_close, pct):
+        """按前收和涨跌幅算涨跌停价，并按交易所规则取整到 0.01 元。
+
+        A 股的涨跌停价不是 prev_close × (1 ± pct) 的原值，而是四舍五入
+        到分。比如前收 3.33、主板 +10%，理论价 3.663，实际涨停价是 3.66。
+        不做这一步的话，3.66 的收盘价会被算成 +9.91%，漏掉一次涨停拦截。
+        """
+        up = np.floor(prev_close * (1.0 + pct) * 100.0 + 0.5) / 100.0
+        down = np.floor(prev_close * (1.0 - pct) * 100.0 + 0.5) / 100.0
+        return up, down
+
+    def _liquidity_amount(self, amount, symbol, i):
+        """流动性上限用的成交额。
+
+        收盘成交模式用当天的成交额；次日开盘模式在开盘时还不知道当天
+        会成交多少，只能用前一天的成交额，否则就是用未来信息限制当下
+        的订单。
+        """
+        j = i - 1 if self.exec_mode == "next_open" else i
+        if j < 0:
+            return float("nan")
+        return amount[symbol].iloc[j]
+
+    @staticmethod
     def limit_pct(symbol: str, is_st: bool = False) -> float:
         """按板块和 ST 状态推断涨跌停幅度。
 
@@ -265,18 +289,18 @@ class MultiAssetBacktester:
         dates, prices, opens, sig_panel, tradable, amount = self._align(data, signals)
         symbols = list(prices.columns)
 
-        # 涨跌停判断: 收盘模式看收盘价相对前收; 次日开盘模式看开盘价相对前收
-        if self.exec_mode == "next_open":
-            pct = opens / prices.shift(1) - 1
-        else:
-            pct = prices.pct_change()
+        # 涨跌停判断: 收盘模式看收盘价相对前收; 次日开盘模式看开盘价相对前收。
+        # 涨跌停价按 0.01 元取整后再比较，和交易所的口径一致。
+        exec_px = opens if self.exec_mode == "next_open" else prices
+        prev_close = prices.shift(1)
         limit_up_panel = pd.DataFrame(False, index=dates, columns=symbols)
         limit_down_panel = pd.DataFrame(False, index=dates, columns=symbols)
         if self.limit_check and len(prices) > 1:
             for s in symbols:
-                lim = self.limit_pct(s, s in self.st_symbols) - 1e-3
-                limit_up_panel[s] = pct[s] >= lim
-                limit_down_panel[s] = pct[s] <= -lim
+                lim = self.limit_pct(s, s in self.st_symbols)
+                up, down = self.limit_prices(prev_close[s], lim)
+                limit_up_panel[s] = exec_px[s] >= up - 1e-9
+                limit_down_panel[s] = exec_px[s] <= down + 1e-9
 
         cash = self.initial_capital
         shares = {s: 0 for s in symbols}
@@ -369,10 +393,10 @@ class MultiAssetBacktester:
                         continue
 
                     # 流动性约束: 单日最多吃掉成交额的一部分
+                    liq_amt = self._liquidity_amount(amount, s, i)
                     if (self.max_participation > 0
-                            and pd.notna(amount[s].iloc[i])
-                            and amount[s].iloc[i] > 0):
-                        cap = int(amount[s].iloc[i] * self.max_participation
+                            and pd.notna(liq_amt) and liq_amt > 0):
+                        cap = int(liq_amt * self.max_participation
                                   / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if sell_shares > cap:
                             sell_shares = cap
@@ -412,10 +436,10 @@ class MultiAssetBacktester:
                     buy_shares = self.broker.calc_shares(budget, epx[s], 1.0)
 
                     # 流动性约束: 单日最多吃掉成交额的一部分
+                    liq_amt = self._liquidity_amount(amount, s, i)
                     if (self.max_participation > 0
-                            and pd.notna(amount[s].iloc[i])
-                            and amount[s].iloc[i] > 0):
-                        cap = int(amount[s].iloc[i] * self.max_participation
+                            and pd.notna(liq_amt) and liq_amt > 0):
+                        cap = int(liq_amt * self.max_participation
                                   / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if buy_shares > cap:
                             buy_shares = cap
