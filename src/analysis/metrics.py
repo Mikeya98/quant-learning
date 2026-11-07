@@ -144,6 +144,75 @@ def calmar_ratio(equity_curve: pd.Series, trading_days: int = 252) -> float:
     return ann_ret / abs(dd_info["max_dd"])
 
 
+def _align_returns(returns: pd.Series, bench_returns: pd.Series):
+    """按日期对齐组合和基准的日收益率，丢掉任一侧缺失的日期"""
+    df = pd.concat([returns.rename("r"), bench_returns.rename("b")], axis=1)
+    return df.dropna()
+
+
+def beta(returns: pd.Series, bench_returns: pd.Series) -> float:
+    """
+    相对基准的 beta。
+
+    beta = cov(r, b) / var(b)
+    基准波动为 0 时返回 0。
+    """
+    df = _align_returns(returns, bench_returns)
+    if len(df) < 2:
+        return 0.0
+    var_b = df["b"].var()
+    if var_b == 0 or np.isnan(var_b):
+        return 0.0
+    return float(df["r"].cov(df["b"]) / var_b)
+
+
+def annualized_alpha(returns: pd.Series, bench_returns: pd.Series,
+                     risk_free_rate: float = 0.03,
+                     trading_days: int = 252) -> float:
+    """
+    Jensen alpha（年化，%）。
+
+    alpha = mean(r - rf_d) - beta * mean(b - rf_d)，再乘 252。
+    没扣掉 beta 那部分时，牛市里随便买个指数都显得"有超额收益"。
+    """
+    df = _align_returns(returns, bench_returns)
+    if len(df) < 2:
+        return 0.0
+
+    rf_d = risk_free_rate / trading_days
+    b = beta(returns, bench_returns)
+    excess = (df["r"] - rf_d) - b * (df["b"] - rf_d)
+    return float(excess.mean() * trading_days * 100)
+
+
+def tracking_error(returns: pd.Series, bench_returns: pd.Series,
+                   trading_days: int = 252) -> float:
+    """跟踪误差（年化，%）：组合与基准日收益差的波动率"""
+    df = _align_returns(returns, bench_returns)
+    if len(df) < 2:
+        return 0.0
+    diff = df["r"] - df["b"]
+    return float(diff.std() * np.sqrt(trading_days) * 100)
+
+
+def information_ratio(returns: pd.Series, bench_returns: pd.Series,
+                      trading_days: int = 252) -> float:
+    """
+    信息比率：单位跟踪误差换来的平均超额收益。
+
+    IR = mean(r - b) / std(r - b) * sqrt(252)
+    和夏普的区别是这里的"超额"是相对基准，不是相对无风险利率。
+    """
+    df = _align_returns(returns, bench_returns)
+    if len(df) < 2:
+        return 0.0
+    diff = df["r"] - df["b"]
+    sd = diff.std()
+    if sd == 0 or np.isnan(sd):
+        return 0.0
+    return float(diff.mean() / sd * np.sqrt(trading_days))
+
+
 def compute_all(result) -> dict:
     """
     一次性计算所有指标。

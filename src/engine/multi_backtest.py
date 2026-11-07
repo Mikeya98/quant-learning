@@ -570,11 +570,15 @@ class MultiAssetBacktester:
         blocked_liquidity: int = 0,
     ) -> dict:
         from ..analysis.metrics import (
+            annualized_alpha,
             annualized_return,
             annualized_volatility,
+            beta,
             daily_returns,
+            information_ratio,
             max_drawdown,
             sharpe_ratio,
+            tracking_error,
         )
 
         rets = daily_returns(equity)
@@ -607,6 +611,10 @@ class MultiAssetBacktester:
             "excess_return_pct": round(
                 (equity.iloc[-1] / equity.iloc[0]
                  - benchmark.iloc[-1] / benchmark.iloc[0]) * 100, 2),
+            "beta": round(beta(rets, bench_rets), 2),
+            "alpha_pct": round(annualized_alpha(rets, bench_rets), 2),
+            "tracking_error_pct": round(tracking_error(rets, bench_rets), 2),
+            "information_ratio": round(information_ratio(rets, bench_rets), 2),
             "avg_pairwise_corr": round(avg_corr, 3),
             "n_rebalances": n_rebalances,
             "n_trades": n_trades,
@@ -652,6 +660,10 @@ def format_report(result: PortfolioResult) -> str:
     lines.append("")
     lines.append(f"  等权基准收益: {s['benchmark_return_pct']:>+11.2f}%")
     lines.append(f"  超额收益:     {s['excess_return_pct']:>+11.2f}%")
+    lines.append(f"  Beta:         {s['beta']:>11.2f}")
+    lines.append(f"  Alpha(年化):  {s['alpha_pct']:>+11.2f}%")
+    lines.append(f"  跟踪误差:     {s['tracking_error_pct']:>11.2f}%")
+    lines.append(f"  信息比率:     {s['information_ratio']:>11.2f}")
     lines.append(f"  平均相关系数: {s['avg_pairwise_corr']:>11.3f}")
     lines.append("")
     lines.append(f"  调仓次数:   {s['n_rebalances']}")

@@ -13,7 +13,7 @@
 - **单标的回测**：Broker（佣金万 2.5 + 最低 5 元 + 千一印花税 + 滑点）、Portfolio、T+1、止损止盈
 - **多标的组合回测**：多个标的对齐、目标权重、定期调仓、先卖后买、等权/动量分配、等权基准对比
 - **成交约束**：涨停不能买、跌停不能卖（涨跌停价按交易所规则取整到 0.01 元）、停牌不成交、单笔不超过成交额的一定比例（次日开盘模式用前一日成交额，避免未来信息）；约束触发次数单独统计
-- **绩效分析**：年化收益、波动率、夏普、最大回撤及持续期、Calmar、盈亏比；净值/回撤/权重/相关矩阵图
+- **绩效分析**：年化收益、波动率、夏普、最大回撤及持续期、Calmar、盈亏比；相对等权基准的 beta、Jensen alpha、跟踪误差、信息比率；净值/回撤/权重/相关矩阵图
 - **参数优化**：网格搜索、滚动优化（walk-forward）
 - **因子 demo**：Fama-French 三因子回归、因子暴露、横截面验证
 - **因子研究**：前向收益、逐日横截面 IC / RankIC、ICIR 与 t 值、分层（quantile）回测、横截面 z-score、多因子合成、IC/分层图
@@ -39,6 +39,11 @@ quant_learning/
 
 ```bash
 pip install -r requirements.txt
+
+# 跑测试。用仓库自带的 venv：Anaconda 环境里 numpy 2.x 和 scipy 1.7 的
+# 二进制不兼容，会报 "numpy.dtype size changed"
+venv/Scripts/python.exe tests/test_metrics.py
+venv/Scripts/python.exe tests/test_multi_backtest.py
 
 # 单只股票
 python main.py fetch 000001
