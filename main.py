@@ -547,6 +547,19 @@ def cmd_portfolio(args):
 
     print("\n" + format_report(result))
 
+    if args.attribution:
+        from src.analysis.attribution import (
+            brinson_attribution, contribution_summary,
+            daily_contributions, format_attribution_report,
+        )
+        daily = daily_contributions(result.prices, result.weights_df,
+                                    result.equity_df)
+        summary = contribution_summary(daily, result.weights_df)
+        industry = load_industry()
+        br = brinson_attribution(result.prices, result.weights_df,
+                                 industry if len(industry) else None)
+        print("\n" + format_attribution_report(summary, br))
+
     print("\n" + "-" * 62)
     print("  日收益率相关矩阵")
     print("-" * 62)
@@ -828,6 +841,8 @@ def build_parser():
                       help="结束日期 YYYYMMDD")
     p_pf.add_argument("--analyze", "-a", action="store_true",
                       help="生成净值和权重图表")
+    p_pf.add_argument("--attribution", action="store_true",
+                      help="打印收益归因（个券贡献 + Brinson）")
 
     # factor 命令
     p_fa2 = subparsers.add_parser("factor", help="因子 IC 分析与分层回测")

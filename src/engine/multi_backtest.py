@@ -41,6 +41,7 @@ class PortfolioResult:
     correlation: pd.DataFrame        # 日收益率相关矩阵
     summary: dict
     config: dict = field(default_factory=dict)
+    prices: pd.DataFrame = None      # 对齐后的收盘价（收益归因用）
 
 
 class MultiAssetBacktester:
@@ -551,6 +552,7 @@ class MultiAssetBacktester:
             correlation=correlation,
             summary=summary,
             config=config,
+            prices=prices,
         )
 
     # ------------------------------------------------------------------

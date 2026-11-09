@@ -14,6 +14,7 @@
 - **多标的组合回测**：多个标的对齐、目标权重、定期调仓、先卖后买、等权/动量分配、等权基准对比
 - **成交约束**：涨停不能买、跌停不能卖（涨跌停价按交易所规则取整到 0.01 元）、停牌不成交、单笔不超过成交额的一定比例（次日开盘模式用前一日成交额，避免未来信息）；约束触发次数单独统计
 - **绩效分析**：年化收益、波动率、夏普、最大回撤及持续期、Calmar、盈亏比；相对等权基准的 beta、Jensen alpha、跟踪误差、信息比率；净值/回撤/权重/相关矩阵图
+- **收益归因**：个券贡献（前一日权重 × 当日涨幅）、残差（费用/成交时点）、Brinson 配置/选择/交互三效应；组合等权基准的恒等式自检，`--attribution` 直接输出
 - **参数优化**：网格搜索、滚动优化（walk-forward）
 - **因子 demo**：Fama-French 三因子回归、因子暴露、横截面验证
 - **因子研究**：前向收益、逐日横截面 IC / RankIC、ICIR 与 t 值、分层（quantile）回测、横截面 z-score、多因子合成、IC/分层图
@@ -57,6 +58,10 @@ python main.py portfolio \
     --symbols 000001,600519,000858,300750,601318,600036,000651,002415 \
     --strategy ma_cross -p fast=10 -p slow=30 \
     --alloc equal --rebalance 5 --start 20190101 --end 20241231 --analyze
+
+# 加 --attribution 打印收益归因
+python main.py portfolio --symbols 000001,600519,000858,300750 \
+    --strategy ma_cross -p fast=5 -p slow=20 --rebalance 5 --attribution
 
 # 次日开盘成交（更接近实盘），并指定 ST 名单
 python main.py portfolio --symbols ... --exec next_open --st-file st.txt
@@ -182,6 +187,7 @@ python tests/test_multi_backtest.py     # 组合回测记账 + 成交约束 + �
 python tests/test_factor_research.py    # 因子计算正确性, 24 项
 python tests/test_neutralize.py         # 中性化正确性 (行业/市值/缺失值/无未来信息), 17 项
 python tests/test_universe.py           # 选池解析、过滤与降级排序 (离线), 19 项
+python tests/test_attribution.py        # 归因无未来信息 + Brinson 恒等式, 22 项
 python main.py --help                   # 所有命令
 ```
 

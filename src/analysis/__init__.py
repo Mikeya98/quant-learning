@@ -2,3 +2,7 @@ from .metrics import compute_all, sharpe_ratio, max_drawdown, win_rate, profit_f
 from .visualize import plot_equity_curve, plot_trade_signals
 from .optimizer import grid_search, walk_forward
 from .portfolio_visualize import plot_portfolio, plot_correlation
+from .attribution import (
+    brinson_attribution, contribution_summary,
+    daily_contributions, format_attribution_report,
+)
