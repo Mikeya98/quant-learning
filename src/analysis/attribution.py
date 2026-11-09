@@ -214,12 +214,23 @@ def brinson_attribution(prices: pd.DataFrame,
 
 
 def format_attribution_report(summary: pd.DataFrame,
-                              brinson: pd.DataFrame) -> str:
-    """终端输出：个券贡献 + Brinson 三效应。"""
+                              brinson: pd.DataFrame,
+                              daily: pd.DataFrame = None) -> str:
+    """终端输出：收益分解 + 个券贡献 + Brinson 三效应。"""
     lines = []
     lines.append("=" * 62)
     lines.append("  收益归因")
     lines.append("=" * 62)
+
+    if daily is not None and "residual" in daily.columns:
+        lines.append("")
+        lines.append("-" * 62)
+        lines.append("  收益分解（日收益算术和）")
+        lines.append("-" * 62)
+        lines.append(f"  个券贡献合计:   {daily['market'].sum() * 100:+9.2f}%")
+        lines.append(f"  交易摩擦残差:   {daily['residual'].sum() * 100:+9.2f}%"
+                     "   (手续费 + 滑点 + 成交时点)")
+        lines.append(f"  净值日收益合计: {daily['equity_ret'].sum() * 100:+9.2f}%")
 
     lines.append("")
     lines.append("-" * 62)
@@ -255,5 +266,6 @@ def format_attribution_report(summary: pd.DataFrame,
     lines.append(f"  超额收益:                     {a['excess'] * 100:+.2f}%")
     lines.append(f"  恒等式误差:                   {a['identity_error'] * 100:+.6f}%")
     lines.append("")
-    lines.append("  注：逐日效应直接累加，和复利口径的净值收益略有差异。")
+    lines.append("  注：逐日效应直接累加，和复利口径的净值收益还差一个波动拖累；")
+    lines.append("      残差主要是手续费和滑点，次日开盘模式还包含开盘到收盘的时点收益。")
     return "\n".join(lines)

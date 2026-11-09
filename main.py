@@ -558,7 +558,7 @@ def cmd_portfolio(args):
         industry = load_industry()
         br = brinson_attribution(result.prices, result.weights_df,
                                  industry if len(industry) else None)
-        print("\n" + format_attribution_report(summary, br))
+        print("\n" + format_attribution_report(summary, br, daily))
 
     print("\n" + "-" * 62)
     print("  日收益率相关矩阵")
