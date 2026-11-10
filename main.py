@@ -560,6 +560,10 @@ def cmd_portfolio(args):
                                  industry if len(industry) else None)
         print("\n" + format_attribution_report(summary, br, daily))
 
+    if args.costs:
+        from src.analysis.costs import cost_breakdown, format_cost_report
+        print("\n" + format_cost_report(cost_breakdown(result.trades_df)))
+
     print("\n" + "-" * 62)
     print("  日收益率相关矩阵")
     print("-" * 62)
@@ -843,6 +847,8 @@ def build_parser():
                       help="生成净值和权重图表")
     p_pf.add_argument("--attribution", action="store_true",
                       help="打印收益归因（个券贡献 + Brinson）")
+    p_pf.add_argument("--costs", action="store_true",
+                      help="打印交易成本拆分（佣金/印花税/过户费/滑点）")
 
     # factor 命令
     p_fa2 = subparsers.add_parser("factor", help="因子 IC 分析与分层回测")

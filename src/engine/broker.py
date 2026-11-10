@@ -4,8 +4,12 @@
 A 股实际规则：
 - 佣金: 万分之 2.5，最低 5 元/笔，买卖都收
 - 印花税: 千分之一，仅卖出时收取
+- 过户费: 万分之 0.1，买卖都收（Phase 15）
 - 手数: 100 股/手，委托必须是 100 的整数倍
 - T+1: 今日买入，最早明日卖出（在 Portfolio 里处理）
+
+Fill 里逐项记录 commission / stamp_duty / transfer_fee / 滑点成本，
+分析层（src/analysis/costs.py）负责汇总，Broker 只管算钱。
 
 滑点模型：
 - 买入: 成交价 = 计划价 × (1 + slippage)，对买方不利
@@ -30,7 +34,9 @@ class Fill:
     price: float          # 成交价（已含滑点）
     commission: float     # 佣金
     stamp_duty: float     # 印花税（仅卖出）
-    total_cost: float     # 总成本（买方: price*shares + commission, 卖方: price*shares - commission - stamp_duty）
+    total_cost: float     # 总成本（买方: 成交额+费用, 卖方: 成交额-费用）
+    transfer_fee: float = 0.0   # 过户费（买卖双向，万分之 0.1）
+    ref_price: float = 0.0      # 决策价（滑点前的计划价）
 
     @property
     def net_amount(self) -> float:
@@ -38,7 +44,30 @@ class Fill:
         if self.side == OrderSide.BUY:
             return self.total_cost
         else:
-            return self.price * self.shares - self.commission - self.stamp_duty
+            return (self.price * self.shares - self.commission
+                    - self.stamp_duty - self.transfer_fee)
+
+    @property
+    def notional(self) -> float:
+        """成交额（按成交价计）"""
+        return self.price * self.shares
+
+    @property
+    def explicit_cost(self) -> float:
+        """显性费用：直接从现金里扣掉的佣金 + 印花税 + 过户费"""
+        return self.commission + self.stamp_duty + self.transfer_fee
+
+    @property
+    def slippage_cost(self) -> float:
+        """滑点成本：成交价相对决策价的价差 × 股数。
+
+        这部分不是额外扣款，而是已经体现在成交价里 —— 同一个价格
+        既算成本又算净值，所以只能作为"如果不滑点能多赚多少"的
+        参考，不能和显性费用直接相加当现金支出。
+        """
+        if self.ref_price <= 0:
+            return 0.0
+        return abs(self.price - self.ref_price) * self.shares
 
 
 class Broker:
@@ -59,12 +88,14 @@ class Broker:
         min_commission: float = 5.0,         # 最低佣金 5 元
         slippage: float = 0.001,            # 0.1% 滑点
         stamp_duty_rate: float = 0.001,     # 千一印花税
+        transfer_fee_rate: float = 0.00001, # 万分之 0.1 过户费（双向）
         lot_size: int = 100,
     ):
         self.commission_rate = commission_rate
         self.min_commission = min_commission
         self.slippage = slippage
         self.stamp_duty_rate = stamp_duty_rate
+        self.transfer_fee_rate = transfer_fee_rate
         self.lot_size = lot_size
 
     # ---- 公开接口 ----
@@ -86,7 +117,8 @@ class Broker:
 
         exec_price = self._slippage_price(price, OrderSide.BUY)
         commission = self._calc_commission(exec_price, shares)
-        total_cost = exec_price * shares + commission
+        transfer_fee = exec_price * shares * self.transfer_fee_rate
+        total_cost = exec_price * shares + commission + transfer_fee
 
         return Fill(
             side=OrderSide.BUY,
@@ -95,6 +127,8 @@ class Broker:
             commission=commission,
             stamp_duty=0.0,   # 买入不收印花税
             total_cost=total_cost,
+            transfer_fee=transfer_fee,
+            ref_price=price,
         )
 
     def execute_sell(self, price: float, shares: int) -> Fill:
@@ -115,6 +149,7 @@ class Broker:
         exec_price = self._slippage_price(price, OrderSide.SELL)
         commission = self._calc_commission(exec_price, shares)
         stamp_duty = exec_price * shares * self.stamp_duty_rate
+        transfer_fee = exec_price * shares * self.transfer_fee_rate
 
         return Fill(
             side=OrderSide.SELL,
@@ -122,7 +157,10 @@ class Broker:
             price=exec_price,
             commission=commission,
             stamp_duty=stamp_duty,
-            total_cost=exec_price * shares - commission - stamp_duty,
+            total_cost=(exec_price * shares - commission
+                        - stamp_duty - transfer_fee),
+            transfer_fee=transfer_fee,
+            ref_price=price,
         )
 
     def calc_shares(self, cash: float, price: float, fraction: float = 1.0) -> int:

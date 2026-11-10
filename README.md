@@ -10,11 +10,12 @@
 
 - **数据层**：akshare 下载 A 股日线，东方财富接口失败时自动切新浪/腾讯；清洗、停牌标记、前复权
 - **策略层**：双均线、MACD、RSI、布林带，统一基类接口；另有纯 Python 增量指标（实盘/模拟盘用）
-- **单标的回测**：Broker（佣金万 2.5 + 最低 5 元 + 千一印花税 + 滑点）、Portfolio、T+1、止损止盈
+- **单标的回测**：Broker（佣金万 2.5 + 最低 5 元 + 卖出千一印花税 + 双向万分之 0.1 过户费 + 滑点）、Portfolio、T+1、止损止盈
 - **多标的组合回测**：多个标的对齐、目标权重、定期调仓、先卖后买、等权/动量分配、等权基准对比
 - **成交约束**：涨停不能买、跌停不能卖（涨跌停价按交易所规则取整到 0.01 元）、停牌不成交、单笔不超过成交额的一定比例（次日开盘模式用前一日成交额，避免未来信息）；约束触发次数单独统计
 - **绩效分析**：年化收益、波动率、夏普、最大回撤及持续期、Calmar、盈亏比；相对等权基准的 beta、Jensen alpha、跟踪误差、信息比率；净值/回撤/权重/相关矩阵图
 - **收益归因**：个券贡献（前一日权重 × 当日涨幅）、残差（费用/成交时点）、Brinson 配置/选择/交互三效应；组合等权基准的恒等式自检，`--attribution` 直接输出
+- **交易成本拆分**：每笔成交拆成佣金、印花税、过户费（显性，直接扣现金）和滑点（隐性，体现在成交价里），按方向/标的汇总并换算成 bps；`--costs` 输出报告。显性成本和滑点分开列，避免把"少赚的钱"和"实际交的钱"加成一个数
 - **参数优化**：网格搜索、滚动优化（walk-forward）
 - **因子 demo**：Fama-French 三因子回归、因子暴露、横截面验证
 - **因子研究**：前向收益、逐日横截面 IC / RankIC、ICIR 与 t 值、分层（quantile）回测、横截面 z-score、多因子合成、IC/分层图
@@ -62,6 +63,10 @@ python main.py portfolio \
 # 加 --attribution 打印收益归因
 python main.py portfolio --symbols 000001,600519,000858,300750 \
     --strategy ma_cross -p fast=5 -p slow=20 --rebalance 5 --attribution
+
+# 加 --costs 打印交易成本拆分（佣金/印花税/过户费/滑点）
+python main.py portfolio --symbols 000001,600519,000858,300750 \
+    --strategy ma_cross -p fast=5 -p slow=20 --rebalance 5 --costs
 
 # 次日开盘成交（更接近实盘），并指定 ST 名单
 python main.py portfolio --symbols ... --exec next_open --st-file st.txt
@@ -183,11 +188,13 @@ turnover_20        -0.0020   -0.0022          -62%           -0%
 ## 测试
 
 ```bash
-python tests/test_multi_backtest.py     # 组合回测记账 + 成交约束 + 次日开盘/ST, 36 项
+python tests/test_multi_backtest.py     # 组合回测记账 + 成交约束 + 次日开盘/ST, 42 项
 python tests/test_factor_research.py    # 因子计算正确性, 24 项
 python tests/test_neutralize.py         # 中性化正确性 (行业/市值/缺失值/无未来信息), 17 项
 python tests/test_universe.py           # 选池解析、过滤与降级排序 (离线), 19 项
 python tests/test_attribution.py        # 归因无未来信息 + Brinson 恒等式, 22 项
+python tests/test_metrics.py            # beta/alpha/跟踪误差/信息比率, 14 项
+python tests/test_costs.py              # 交易成本四项拆分 + 汇总 + 空表兼容, 45 项
 python main.py --help                   # 所有命令
 ```
 

@@ -417,7 +417,13 @@ class MultiAssetBacktester:
                         "side": "SELL",
                         "shares": fill.shares,
                         "price": round(fill.price, 4),
-                        "fee": round(fill.commission + fill.stamp_duty, 2),
+                        "ref_price": round(fill.ref_price, 4),
+                        "notional": round(fill.notional, 2),
+                        "commission": round(fill.commission, 2),
+                        "stamp_duty": round(fill.stamp_duty, 2),
+                        "transfer_fee": round(fill.transfer_fee, 2),
+                        "slippage": round(fill.slippage_cost, 2),
+                        "fee": round(fill.explicit_cost, 2),
                     })
 
                 # ---- 3b. 再买: 用可用现金补到目标权重 ----
@@ -464,7 +470,13 @@ class MultiAssetBacktester:
                         "side": "BUY",
                         "shares": fill.shares,
                         "price": round(fill.price, 4),
-                        "fee": round(fill.commission, 2),
+                        "ref_price": round(fill.ref_price, 4),
+                        "notional": round(fill.notional, 2),
+                        "commission": round(fill.commission, 2),
+                        "stamp_duty": round(fill.stamp_duty, 2),
+                        "transfer_fee": round(fill.transfer_fee, 2),
+                        "slippage": round(fill.slippage_cost, 2),
+                        "fee": round(fill.explicit_cost, 2),
                     })
 
                 prev_target_set = target_set
