@@ -566,6 +566,36 @@ def cmd_portfolio(args):
                                  industry if len(industry) else None)
         print("\n" + format_attribution_report(summary, br, daily))
 
+    if args.factor_attribution:
+        from src.analysis.factor_model import (
+            build_factor_returns, estimate_exposures,
+            out_of_sample_attribution,
+            factor_contribution, format_factor_report,
+        )
+        from src.data.meta import float_mktcap
+
+        # 市值只用于 SMB 因子; 成交额/换手率缺失时自动降级成两因子
+        _, _, turnover, amount = _load_universe(
+            list(result.prices.columns), start, end)
+        cap = None
+        if amount is not None and turnover is not None:
+            cap = float_mktcap(amount, turnover)
+
+        fr = build_factor_returns(result.prices, mktcap=cap,
+                                  mom_window=args.factor_mom)
+        eq = result.equity_df.copy()
+        eq["date"] = pd.to_datetime(eq["date"])
+        port_ret = eq.set_index("date")["equity"].pct_change()
+
+        if args.factor_oos:
+            model, contrib = out_of_sample_attribution(
+                port_ret, fr, split=args.factor_oos)
+        else:
+            model = estimate_exposures(
+                port_ret, fr, window=args.factor_window or None)
+            contrib = factor_contribution(model)
+        print("\n" + format_factor_report(model, contrib))
+
     if args.costs:
         from src.analysis.costs import cost_breakdown, format_cost_report
         print("\n" + format_cost_report(cost_breakdown(result.trades_df)))
@@ -859,6 +889,14 @@ def build_parser():
                       help="生成净值和权重图表")
     p_pf.add_argument("--attribution", action="store_true",
                       help="打印收益归因（个券贡献 + Brinson）")
+    p_pf.add_argument("--factor-attribution", action="store_true",
+                      help="把组合收益回归到自建 MKT/SMB/MOM 三因子")
+    p_pf.add_argument("--factor-mom", type=int, default=20,
+                      help="动量因子的回看天数（默认 20）")
+    p_pf.add_argument("--factor-window", type=int, default=0,
+                      help="滚动 beta 的窗口长度（默认 0 = 不滚动）")
+    p_pf.add_argument("--factor-oos", type=float, default=0.0,
+                      help="样本外分解：前半段占比，例如 0.5（默认 0 = 不做）")
     p_pf.add_argument("--costs", action="store_true",
                       help="打印交易成本拆分（佣金/印花税/过户费/滑点）")
 

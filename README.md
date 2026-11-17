@@ -15,6 +15,7 @@
 - **成交约束**：涨停不能买、跌停不能卖（涨跌停价按交易所规则取整到 0.01 元）、停牌不成交、单笔不超过成交额的一定比例（次日开盘模式用前一日成交额，避免未来信息）；约束触发次数单独统计
 - **绩效分析**：年化收益、波动率、夏普、最大回撤及持续期、Calmar、盈亏比；相对等权基准的 beta、Jensen alpha、跟踪误差、信息比率；净值/回撤/权重/相关矩阵图
 - **收益归因**：个券贡献（前一日权重 × 当日涨幅）、残差（费用/成交时点）、Brinson 配置/选择/交互三效应；组合等权基准的恒等式自检，`--attribution` 直接输出
+- **因子归因**：从回测数据里自建 MKT / SMB / MOM 三因子（全池等权、小减大市值、过去 N 日赢家减输家），把组合日收益回归到因子上，给出风格暴露、t 值、R² 和收益分解。分组只用 t-1 信息，避免未来函数。`--factor-attribution` 输出报告；带截距的样本内回归残差总和恒为 0，所以另做 `--factor-oos 0.5` 样本外分解（前半段估 beta、后半段算残差），才能真正看到选股贡献
 - **交易成本拆分**：每笔成交拆成佣金、印花税、过户费（显性，直接扣现金）和滑点（隐性，体现在成交价里），按方向/标的汇总并换算成 bps；`--costs` 输出报告。显性成本和滑点分开列，避免把"少赚的钱"和"实际交的钱"加成一个数
 - **平方根冲击成本**：`--slip-model sqrt` 在固定滑点之外叠加 `impact_coeff × sqrt(参与率)`，参与率 = 本笔成交额 / 当日成交额；参与率随股数变化，`calc_shares` 迭代收敛到含冲击的真实预算。trades 表记录每笔 `participation` 和 `impact_bps`，`--costs` 增加"冲击成本"区块（平均/最高参与率、冲击占滑点比例）。成交额缺失时退化成固定滑点
 - **参数优化**：网格搜索、滚动优化（walk-forward）
@@ -64,6 +65,13 @@ python main.py portfolio \
 # 加 --attribution 打印收益归因
 python main.py portfolio --symbols 000001,600519,000858,300750 \
     --strategy ma_cross -p fast=5 -p slow=20 --rebalance 5 --attribution
+
+# 加 --factor-attribution 打印因子归因（MKT/SMB/MOM）
+#   --factor-oos 0.5 做样本外分解；--factor-mom 20 调动量回看天数
+python main.py portfolio \
+    --symbols 000001,600519,000858,300750,601318,600036 \
+    --strategy ma_cross -p fast=5 -p slow=20 --rebalance 5 \
+    --factor-attribution --factor-oos 0.5
 
 # 加 --costs 打印交易成本拆分（佣金/印花税/过户费/滑点）
 python main.py portfolio --symbols 000001,600519,000858,300750 \
