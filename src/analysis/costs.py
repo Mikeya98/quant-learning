@@ -113,7 +113,7 @@ def cost_breakdown(trades) -> dict:
         by_side = pd.DataFrame()
         by_symbol = pd.DataFrame()
 
-    return {
+    result = {
         "n_trades": int(len(t)),
         "notional": notional,
         "commission": commission,
@@ -128,6 +128,20 @@ def cost_breakdown(trades) -> dict:
         "by_side": by_side,
         "by_symbol": by_symbol,
     }
+
+    # Phase 16: 平方根冲击模型下, trades 里带参与率和冲击 bps
+    if len(t) and "impact_bps" in t.columns:
+        impact_cost = float((t["impact_bps"] / 10000.0 * t["notional"]).sum())
+        result["impact_cost"] = impact_cost
+        result["impact_bps"] = _bps(impact_cost, notional)
+        result["avg_participation"] = float(t["participation"].mean()) \
+            if "participation" in t.columns else 0.0
+        result["impact_share"] = (impact_cost / slippage
+                                  if slippage > 0 else 0.0)
+        result["max_participation"] = float(t["participation"].max()) \
+            if "participation" in t.columns else 0.0
+
+    return result
 
 
 def format_cost_report(bd: dict, top_n: int = 5) -> str:
@@ -164,6 +178,15 @@ def format_cost_report(bd: dict, top_n: int = 5) -> str:
     lines.append(f"  估算总拖累: {bd['total_cost']:>12,.2f}"
                  f"  ({bd['total_bps']:.1f} bps / 成交额)")
     lines.append("")
+
+    if "impact_cost" in bd:
+        lines.append("  冲击成本（平方根模型）")
+        lines.append(f"    平均参与率: {bd['avg_participation'] * 100:.2f}%  "
+                     f"(最高 {bd['max_participation'] * 100:.2f}%)")
+        lines.append(f"    冲击成本:   {bd['impact_cost']:>12,.2f}"
+                     f"  ({bd['impact_bps']:.1f} bps / 成交额)")
+        lines.append(f"    占滑点比例: {bd['impact_share'] * 100:.1f}%")
+        lines.append("")
 
     by_side = bd["by_side"]
     if len(by_side):

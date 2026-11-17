@@ -67,9 +67,18 @@ class MultiAssetBacktester:
         align: str = "union",
         exec_mode: str = "close",
         st_symbols=None,
+        slippage_model: str = "fixed",
+        impact_coeff: float = 0.01,
+        max_impact: float = 0.05,
     ):
         self.initial_capital = initial_capital
-        self.broker = Broker(commission_rate=commission_rate, slippage=slippage)
+        self.broker = Broker(
+            commission_rate=commission_rate,
+            slippage=slippage,
+            slippage_model=slippage_model,
+            impact_coeff=impact_coeff,
+            max_impact=max_impact,
+        )
         self.rebalance_days = max(1, rebalance_days)
         self.min_weight_change = min_weight_change
         self.limit_check = limit_check
@@ -387,16 +396,25 @@ class MultiAssetBacktester:
                         blocked_limit += 1            # 跌停, 没有买盘
                         continue
 
-                    sell_shares = int(delta / (epx[s] * (1 - self.broker.slippage)))
+                    # 流动性上限用的成交额 (次日开盘模式用前一日)
+                    liq_amt = self._liquidity_amount(amount, s, i)
+                    daily_amt = (float(liq_amt)
+                                 if pd.notna(liq_amt) and liq_amt > 0 else None)
+
+                    # 股数按"固定滑点 + 预计冲击"倒推, 参与率先按未限额股数估
+                    part_est = self.broker.participation(
+                        int(delta / epx[s]), epx[s], daily_amt)
+                    slip_est = (self.broker.slippage
+                                + self.broker.impact_rate(part_est))
+                    sell_shares = int(delta / (epx[s] * (1 - slip_est)))
                     sell_shares = min(sell_shares, shares[s])
                     sell_shares = (sell_shares // self.broker.lot_size) * self.broker.lot_size
                     if sell_shares <= 0:
                         continue
 
                     # 流动性约束: 单日最多吃掉成交额的一部分
-                    liq_amt = self._liquidity_amount(amount, s, i)
                     if (self.max_participation > 0
-                            and pd.notna(liq_amt) and liq_amt > 0):
+                            and daily_amt is not None):
                         cap = int(liq_amt * self.max_participation
                                   / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if sell_shares > cap:
@@ -405,7 +423,8 @@ class MultiAssetBacktester:
                         if sell_shares <= 0:
                             continue
 
-                    fill = self.broker.execute_sell(epx[s], sell_shares)
+                    fill = self.broker.execute_sell(
+                        epx[s], sell_shares, daily_amount=daily_amt)
                     cash += fill.net_amount
                     shares[s] -= sell_shares
                     flow[s] += fill.net_amount
@@ -424,6 +443,8 @@ class MultiAssetBacktester:
                         "transfer_fee": round(fill.transfer_fee, 2),
                         "slippage": round(fill.slippage_cost, 2),
                         "fee": round(fill.explicit_cost, 2),
+                        "participation": round(fill.participation, 6),
+                        "impact_bps": round(fill.impact_rate * 10000, 2),
                     })
 
                 # ---- 3b. 再买: 用可用现金补到目标权重 ----
@@ -439,13 +460,18 @@ class MultiAssetBacktester:
                         blocked_limit += 1            # 涨停, 没有卖盘
                         continue
 
+                    # 流动性上限用的成交额；平方根模型还要用它估冲击
+                    liq_amt = self._liquidity_amount(amount, s, i)
+                    daily_amt = (float(liq_amt)
+                                 if pd.notna(liq_amt) and liq_amt > 0 else None)
+
                     budget = min(delta, cash)
-                    buy_shares = self.broker.calc_shares(budget, epx[s], 1.0)
+                    buy_shares = self.broker.calc_shares(
+                        budget, epx[s], 1.0, daily_amount=daily_amt)
 
                     # 流动性约束: 单日最多吃掉成交额的一部分
-                    liq_amt = self._liquidity_amount(amount, s, i)
                     if (self.max_participation > 0
-                            and pd.notna(liq_amt) and liq_amt > 0):
+                            and daily_amt is not None):
                         cap = int(liq_amt * self.max_participation
                                   / epx[s] // self.broker.lot_size) * self.broker.lot_size
                         if buy_shares > cap:
@@ -454,7 +480,8 @@ class MultiAssetBacktester:
                     if buy_shares <= 0:
                         continue
 
-                    fill = self.broker.execute_buy(epx[s], buy_shares)
+                    fill = self.broker.execute_buy(
+                        epx[s], buy_shares, daily_amount=daily_amt)
                     if fill.net_amount > cash:
                         continue                      # 资金不够 (最低佣金导致)
 
@@ -477,6 +504,8 @@ class MultiAssetBacktester:
                         "transfer_fee": round(fill.transfer_fee, 2),
                         "slippage": round(fill.slippage_cost, 2),
                         "fee": round(fill.explicit_cost, 2),
+                        "participation": round(fill.participation, 6),
+                        "impact_bps": round(fill.impact_rate * 10000, 2),
                     })
 
                 prev_target_set = target_set
@@ -554,6 +583,9 @@ class MultiAssetBacktester:
             "exec_mode": self.exec_mode,
             "st_symbols": len(self.st_symbols),
             "align": self.align,
+            "slippage_model": self.broker.slippage_model,
+            "impact_coeff": self.broker.impact_coeff,
+            "max_impact": self.broker.max_impact,
         }
 
         return PortfolioResult(

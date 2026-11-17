@@ -519,6 +519,9 @@ def cmd_portfolio(args):
     print(f"\n组合回测: {len(data)} 只标的, {strategy_name}")
     print(f"区间: {args.start} ~ {args.end}, 调仓周期: {args.rebalance} 日, "
           f"成交价: {exec_label}")
+    if args.slip_model == "sqrt":
+        print(f"滑点模型: 平方根冲击, 系数 {args.impact_coeff}, "
+              f"上限 {args.max_impact * 100:.1f}%")
 
     # ST 名单从文件读；--exec / --st-file 以前只加到了参数表，没有传进
     # 回测器，命令行实际一直按默认的收盘成交跑。
@@ -536,6 +539,9 @@ def cmd_portfolio(args):
         align=args.align,
         exec_mode=args.exec_mode,
         st_symbols=st_symbols,
+        slippage_model=args.slip_model,
+        impact_coeff=args.impact_coeff,
+        max_impact=args.max_impact,
     )
     result = engine.run(
         data, signals,
@@ -833,6 +839,12 @@ def build_parser():
                       help="关闭涨跌停成交约束")
     p_pf.add_argument("--max-participation", type=float, default=0.10,
                       help="单日最多吃掉成交额的比例（默认 0.10，0=不限制）")
+    p_pf.add_argument("--slip-model", choices=["fixed", "sqrt"], default="fixed",
+                      help="滑点模型：fixed 固定比例（默认）| sqrt 平方根冲击")
+    p_pf.add_argument("--impact-coeff", type=float, default=0.01,
+                      help="平方根冲击系数（默认 0.01，参与率 100%% 时冲击 1%%）")
+    p_pf.add_argument("--max-impact", type=float, default=0.05,
+                      help="单笔冲击成本上限（默认 0.05）")
     p_pf.add_argument("--exec", dest="exec_mode", choices=["close", "next_open"],
                       default="close", help="成交价：当日收盘 / 次日开盘")
     p_pf.add_argument("--st-file", help="ST 股票代码文件（一行一个，用于 ±5%% 涨跌停）")
