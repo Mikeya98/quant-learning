@@ -23,6 +23,7 @@
 - **因子研究**：前向收益、逐日横截面 IC / RankIC、ICIR 与 t 值、分层（quantile）回测、横截面 z-score、多因子合成、IC/分层图
 - **因子中性化**：每日缩尾（分位数 / MAD）、行业去均值、市值回归取残差（多元残差化）、中性化前后 IC 与暴露对比
 - **股票池**：全市场快照 → 过滤 ST/北交所 → 按流通市值取前 N → 补行业分类，结果落盘复用；东财快照限流时自动降级到新浪行情，按当日成交额选池
+- **多因子选股组合**：把因子研究接进组合引擎——每个调仓日横截面打分、取前 N 只等权持有，中间不再换股。分数支持等权合成和**滚动 IC 加权**：只用 `t-ic_period` 以前已知的 IC 给因子加权重，IC 为负的因子自动反向使用，避免"动量在 A 股某些年份失效时把组合带偏"。`factor-portfolio` 命令同时输出合成分数与单因子 IC 诊断、持仓换手统计，再用同一套涨跌停/停牌/流动性约束做回测
 
 ## 目录
 
@@ -31,7 +32,7 @@ quant_learning/
 ├── main.py                    # 命令行入口
 ├── src/
 │   ├── data/                  # 数据获取 (多源回退)、清洗、CSV 存储、行业/市值元数据、选池
-│   ├── strategy/              # 策略基类 + 4 个经典策略 + 实时指标
+│   ├── strategy/              # 策略基类 + 4 个经典策略 + 实时指标 + 多因子选股
 │   ├── engine/                # Broker / Portfolio / 单标的回测 / 组合回测
 │   ├── analysis/              # 绩效指标、图表、参数优化、因子分析、报告
 │   └── risk/                  # 止损止盈 / 仓位管理
@@ -94,6 +95,18 @@ python main.py universe --top 20 --fetch --start 20190101 --end 20241231
 python main.py factor \
     --symbols 000001,600519,000858,300750,601318,600036,000651,002415 \
     --period 5 --quantiles 5 --analyze
+
+# 多因子选股组合：每 10 个交易日按合成分数取前 5 只，次日开盘调仓
+python main.py factor-portfolio \
+    --symbols 000001,000651,000858,300750,600519,601318 \
+    --factors momentum_20,reversal_5,vol_20 \
+    --top 5 --rebalance 10 --exec next_open --start 20190101 --end 20241231
+
+# 滚动 IC 加权：因子方向由历史 IC 决定，负 IC 自动反向
+python main.py factor-portfolio \
+    --symbols 000001,000651,000858,300750,600519,601318 \
+    --factors momentum_20,reversal_5,vol_20 \
+    --weight-mode ic --ic-window 60 --top 5 --rebalance 10
 ```
 
 组合回测的输出（节选）：

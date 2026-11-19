@@ -47,6 +47,10 @@ from src.analysis.neutralize import (
     neutralize_factor, size_exposure, industry_exposure,
 )
 from src.data.meta import load_industry, float_mktcap, log_size
+from src.strategy.factor_selection import (
+    DEFAULT_FACTORS, composite_score, ic_weighted_score, select_top,
+    signals_from_selection, selection_turnover,
+)
 
 
 def cmd_fetch(args):
@@ -615,6 +619,155 @@ def cmd_portfolio(args):
     return result
 
 
+def cmd_factor_portfolio(args):
+    """多因子选股 → 组合回测"""
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 2:
+        print("多因子组合至少需要 2 只股票")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+
+    # 原始表保留 open，next_open 模式要用开盘价成交
+    data = {}
+    for symbol in symbols:
+        try:
+            df = load_csv(symbol, processed=True)
+        except FileNotFoundError:
+            print(f"缺少数据: {symbol}，先运行 fetch-all")
+            return
+        df = df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+        if len(df) < 60:
+            print(f"[WARN] {symbol} 在区间内只有 {len(df)} 条数据，跳过")
+            continue
+        data[symbol] = df
+
+    if len(data) < 2:
+        print("可用标的不够，无法组合回测")
+        return
+
+    close = pd.DataFrame({
+        s: df.set_index(pd.to_datetime(df["date"]))["close"] for s, df in data.items()
+    }).sort_index()
+    volume = pd.DataFrame({
+        s: df.set_index(pd.to_datetime(df["date"]))["volume"] for s, df in data.items()
+    }).sort_index()
+    turnover = None
+    if all("turnover" in df.columns for df in data.values()):
+        turnover = pd.DataFrame({
+            s: df.set_index(pd.to_datetime(df["date"]))["turnover"]
+            for s, df in data.items()
+        }).sort_index()
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    weights = None
+    if args.weights:
+        vals = [float(x) for x in args.weights.split(",") if x.strip()]
+        if len(vals) != len(names):
+            print(f"--weights 需要 {len(names)} 个值（和 --factors 一一对应）")
+            return
+        weights = dict(zip(names, vals))
+
+    try:
+        if args.weight_mode == "ic":
+            score = ic_weighted_score(
+                close, volume, turnover,
+                factors=names,
+                ic_period=args.ic_period or args.period,
+                ic_window=args.ic_window,
+            )
+        else:
+            score = composite_score(close, volume, turnover,
+                                    factors=names, weights=weights)
+    except ValueError as e:
+        print(e)
+        return
+
+    print(f"\n多因子选股: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}"
+          + ("  权重: 滚动 IC 自适应" if args.weight_mode == "ic"
+             else (f"  权重: {weights}" if weights else "  (等权)")))
+    if args.weight_mode == "ic":
+        print(f"      IC 估计: {args.ic_period or args.period} 日前向收益, "
+              f"rolling {args.ic_window} 个 IC, 不用未来信息")
+
+    # ---- 诊断: 合成分数本身有没有信息 ----
+    fwd = compute_forward_returns(close, periods=args.period)
+    ic = compute_ic(score, fwd)
+    if ic.n_samples:
+        print(f"[因子诊断] 合成分数 vs {args.period} 日前向收益: "
+              f"mean IC={ic.mean_ic:+.4f}, ICIR={ic.icir:.3f}, "
+              f"t={ic.t_stat:.2f}, 胜率={ic.positive_ratio:.0%}, "
+              f"n={ic.n_samples}")
+    else:
+        print(f"[因子诊断] 有效样本不足，无法计算 IC")
+
+    # 单因子 IC 对照，方便看合成是否有意义
+    from src.analysis.factor_research import make_factors
+    library = make_factors(close, volume, turnover)
+    for name in names:
+        one = compute_ic(library[name], fwd)
+        if one.n_samples:
+            print(f"            {name:<14} IC={one.mean_ic:+.4f} "
+                  f"ICIR={one.icir:+.3f} t={one.t_stat:+.2f}")
+
+    # ---- 选股 ----
+    selected = select_top(score, top_n=args.top,
+                          rebalance_days=args.rebalance,
+                          min_score=args.min_score)
+    stats = selection_turnover(selected)
+    print(f"[选股] 每 {args.rebalance} 个交易日重排一次，取前 {args.top} 只；"
+          f"平均持仓 {stats['avg_names']:.1f} 只，"
+          f"持仓变化 {stats['changed_days']} 次"
+          + (f"（平均换手 {stats['avg_change_pct']:.0%}）"
+             if stats['changed_days'] else ""))
+    if stats['changed_days'] == 0:
+        print("[选股] 整个区间没有建仓：检查因子窗口是否小于数据长度")
+        return
+
+    last = selected.index[-1]
+    held = list(selected.columns[selected.loc[last].to_numpy()])
+    if held:
+        print(f"[选股] 期末持仓: {', '.join(held)}")
+
+    signals = signals_from_selection(selected, data)
+
+    st_symbols = set()
+    if args.st_file:
+        from src.data import st_symbols_from_file
+        st_symbols = st_symbols_from_file(args.st_file)
+        print(f"ST 名单: {len(st_symbols)} 只 ({args.st_file})")
+
+    engine = MultiAssetBacktester(
+        initial_capital=args.capital,
+        rebalance_days=args.rebalance,
+        limit_check=not args.no_limit,
+        max_participation=args.max_participation,
+        align=args.align,
+        exec_mode=args.exec_mode,
+        st_symbols=st_symbols,
+        slippage_model=args.slip_model,
+        impact_coeff=args.impact_coeff,
+        max_impact=args.max_impact,
+    )
+    result = engine.run(
+        data, signals,
+        alloc="equal",
+        strategy_name=f"factor({','.join(names)}) top{args.top}",
+    )
+    print("\n" + format_report(result))
+
+    if args.costs:
+        from src.analysis.costs import cost_breakdown, format_cost_report
+        print("\n" + format_cost_report(cost_breakdown(result.trades_df)))
+
+    return result
+
+
 def _load_universe(symbols, start, end):
     """把多只股票的 CSV 拼成宽表 (index=日期, columns=代码)"""
     fields = {"close": {}, "volume": {}, "turnover": {}, "amount": {}}
@@ -925,6 +1078,53 @@ def build_parser():
     p_fa2.add_argument("--analyze", "-a", action="store_true",
                        help="生成 IC 和分层图表")
 
+    # factor-portfolio 命令
+    p_fp = subparsers.add_parser("factor-portfolio",
+                                 help="多因子选股 + 组合回测")
+    p_fp.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_fp.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_fp.add_argument("--weights", default="",
+                      help="因子权重，逗号分隔（默认等权）")
+    p_fp.add_argument("--weight-mode", choices=["equal", "ic"],
+                      default="equal",
+                      help="因子加权方式：equal 固定权重 / ic 滚动 IC 自适应")
+    p_fp.add_argument("--ic-window", type=int, default=60,
+                      help="IC 加权用的滚动窗口，交易日（默认 60）")
+    p_fp.add_argument("--ic-period", type=int, default=0,
+                      help="估计 IC 用的前向收益期（默认与 --period 相同）")
+    p_fp.add_argument("--top", type=int, default=3,
+                      help="每期持有几只（默认 3）")
+    p_fp.add_argument("--rebalance", type=int, default=10,
+                      help="调仓周期，交易日（默认 10）")
+    p_fp.add_argument("--period", type=int, default=5,
+                      help="IC 诊断用的前向收益期（默认 5 日）")
+    p_fp.add_argument("--min-score", type=float, default=None,
+                      help="合成分数下限（默认不设）")
+    p_fp.add_argument("--capital", type=float, default=100000,
+                      help="初始资金（默认 100000）")
+    p_fp.add_argument("--no-limit", action="store_true",
+                      help="关闭涨跌停拦截")
+    p_fp.add_argument("--max-participation", type=float, default=0.10,
+                      help="单日成交额占比上限（默认 0.10）")
+    p_fp.add_argument("--slip-model", choices=["fixed", "sqrt"],
+                      default="fixed", help="滑点模型")
+    p_fp.add_argument("--impact-coeff", type=float, default=0.01,
+                      help="平方根冲击系数")
+    p_fp.add_argument("--max-impact", type=float, default=0.05,
+                      help="冲击率上限")
+    p_fp.add_argument("--exec", dest="exec_mode",
+                      choices=["close", "next_open"], default="next_open",
+                      help="成交价（默认次日开盘）")
+    p_fp.add_argument("--st-file", help="ST 股票代码文件")
+    p_fp.add_argument("--align", choices=["union", "intersection"],
+                      default="union", help="多标的数据对齐方式")
+    p_fp.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fp.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+    p_fp.add_argument("--costs", action="store_true",
+                      help="打印交易成本拆分")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -962,6 +1162,8 @@ def main():
         cmd_portfolio(args)
     elif args.command == "factor":
         cmd_factor(args)
+    elif args.command == "factor-portfolio":
+        cmd_factor_portfolio(args)
     elif args.command == "universe":
         cmd_universe(args)
     else:
