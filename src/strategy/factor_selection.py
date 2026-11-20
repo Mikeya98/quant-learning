@@ -33,6 +33,7 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from ..analysis.factor_orthogonal import prepare_factors
 from ..analysis.factor_research import (
     combine_factors,
     compute_forward_returns,
@@ -61,11 +62,23 @@ def composite_score(
     turnover: Optional[pd.DataFrame] = None,
     factors: Optional[Iterable[str]] = None,
     weights: Optional[Dict[str, float]] = None,
+    *,
+    winsorize: bool = False,
+    industry=None,
+    log_mktcap: Optional[pd.DataFrame] = None,
+    orthogonalize: bool = False,
 ) -> pd.DataFrame:
     """构造多因子合成分数 (宽表: index=日期, columns=代码)。
 
     因子候选取自 factor_research.make_factors；不在候选里的名字直接报错，
     免得手误时静默变成一个空组合。
+
+    v0.19 起可以先做预处理再合成：
+      winsorize       每日分位缩尾，压掉极端值
+      industry        行业宽表/Series，传入后逐日行业内去均值
+      log_mktcap      ln(流通市值) 宽表，传入后逐日回归取残差
+      orthogonalize   按 factors 的顺序逐日正交化，后面的因子剥离前面
+                      已经解释掉的部分
     """
     library = make_factors(close, volume, turnover)
     names = list(factors) if factors else [n for n in DEFAULT_FACTORS if n in library]
@@ -78,13 +91,23 @@ def composite_score(
     if not names:
         raise ValueError("没有可用因子")
 
-    chosen = {n: library[n] for n in names}
+    chosen = prepare_factors(
+        library, names,
+        winsorize=winsorize,
+        industry=industry,
+        log_mktcap=log_mktcap,
+        orthogonalize=orthogonalize,
+    )
 
     # combine_factors 会把 NaN 填成 0 分，直接拿来排序会让"没有数据"
     # 的股票混进中位。先记下每个位置是否所有因子都有值，最后再掩回去。
     valid = pd.DataFrame(True, index=close.index, columns=close.columns)
     for df in chosen.values():
         valid &= df.notna()
+
+    # 只给选中的因子权重，避免调用方把旧权重带进来
+    if weights is not None:
+        weights = {n: weights.get(n, 0.0) for n in names}
 
     score = combine_factors(chosen, weights=weights)
     return score.where(valid)
@@ -128,6 +151,11 @@ def ic_weighted_score(
     ic_period: int = 20,
     ic_window: int = 60,
     min_ic_obs: int = 20,
+    *,
+    winsorize: bool = False,
+    industry=None,
+    log_mktcap: Optional[pd.DataFrame] = None,
+    orthogonalize: bool = False,
 ) -> pd.DataFrame:
     """按滚动 IC 给因子加权，方向跟着历史 IC 走。
 
@@ -145,6 +173,10 @@ def ic_weighted_score(
 
     权重前 min_ic_obs 个点不足时该因子不参与；所有因子都没准备好时
     这一天没有分数（NaN），选股会继续等。
+
+    v0.19 的缩尾/行业/市值/正交化参数和 composite_score 一致，并且
+    IC 也在预处理后的因子上估计 —— 用原始动量算 IC、用中性化动量
+    打分，两边的信号不是同一个东西。
     """
     library = make_factors(close, volume, turnover)
     names = list(factors) if factors else [n for n in DEFAULT_FACTORS if n in library]
@@ -159,7 +191,13 @@ def ic_weighted_score(
     if ic_period <= 0:
         raise ValueError("ic_period must be positive")
 
-    chosen = {n: library[n] for n in names}
+    chosen = prepare_factors(
+        library, names,
+        winsorize=winsorize,
+        industry=industry,
+        log_mktcap=log_mktcap,
+        orthogonalize=orthogonalize,
+    )
     fwd = compute_forward_returns(close, periods=ic_period)
     weights = rolling_ic_weights(chosen, fwd, index=close.index,
                                  ic_period=ic_period,

@@ -114,8 +114,37 @@ def test_portfolio_cli_wiring():
             pass
 
 
+def test_factor_portfolio_flags():
+    print("\n== factor-portfolio 预处理参数 ==")
+
+    parser = cli.build_parser()
+    args = parser.parse_args([
+        "factor-portfolio",
+        "--symbols", "000001,600036",
+        "--winsorize",
+        "--neutralize", "industry,size",
+        "--orthogonalize",
+        "--industry-file", "data/meta/industry.csv",
+    ])
+
+    check(args.winsorize is True, "--winsorize 传进参数表")
+    check(args.neutralize == "industry,size", "--neutralize 原样保留")
+    check(args.orthogonalize is True, "--orthogonalize 传进参数表")
+    check(args.industry_file == "data/meta/industry.csv",
+          "--industry-file 传进参数表")
+
+    # 默认值：不预处理
+    args2 = parser.parse_args([
+        "factor-portfolio", "--symbols", "000001,600036",
+    ])
+    check(args2.winsorize is False and args2.neutralize == ""
+          and args2.orthogonalize is False,
+          "默认关闭所有预处理")
+
+
 def main():
     test_portfolio_cli_wiring()
+    test_factor_portfolio_flags()
     print("\n" + "=" * 40)
     print(f"  {PASS} passed, {FAIL} failed")
     print("=" * 40)

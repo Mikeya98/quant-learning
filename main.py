@@ -663,6 +663,46 @@ def cmd_factor_portfolio(args):
     names = [f.strip() for f in args.factors.split(",") if f.strip()] \
         if args.factors else list(DEFAULT_FACTORS)
 
+    # ---- v0.19: 预处理选项 (缩尾 / 行业 / 市值 / 正交化) ----
+    neutralize = {x.strip() for x in (args.neutralize or "").split(",") if x.strip()}
+    bad = neutralize - {"industry", "size"}
+    if bad:
+        print(f"未知的中性化项: {', '.join(sorted(bad))}（可用 industry,size）")
+        return
+
+    industry = None
+    log_mktcap = None
+
+    if "industry" in neutralize:
+        industry = load_industry(args.industry_file)
+        known = int(industry.notna().sum()) if hasattr(industry, "notna") else 0
+        print(f"[中性化] 行业分类: {known} 只有行业信息"
+              + (f"（{args.industry_file}）" if args.industry_file else ""))
+
+    if "size" in neutralize:
+        if turnover is None:
+            print("市值中性化需要 turnover 列，当前数据不完整")
+            return
+        amounts = pd.DataFrame({
+            s: df.set_index(pd.to_datetime(df["date"]))["amount"]
+            for s, df in data.items()
+        }).sort_index()
+        log_mktcap = log_size(float_mktcap(amounts, turnover))
+        print(f"[中性化] 流通市值 = 成交额 / 换手率，"
+              f"{log_mktcap.notna().sum().sum()} 个有效点")
+
+    if args.winsorize or neutralize or args.orthogonalize:
+        steps = []
+        if args.winsorize:
+            steps.append("缩尾")
+        if "industry" in neutralize:
+            steps.append("行业中性")
+        if "size" in neutralize:
+            steps.append("市值中性")
+        if args.orthogonalize:
+            steps.append("正交化")
+        print(f"[预处理] {' → '.join(steps)}；正交化顺序: {', '.join(names)}")
+
     weights = None
     if args.weights:
         vals = [float(x) for x in args.weights.split(",") if x.strip()]
@@ -678,10 +718,18 @@ def cmd_factor_portfolio(args):
                 factors=names,
                 ic_period=args.ic_period or args.period,
                 ic_window=args.ic_window,
+                winsorize=args.winsorize,
+                industry=industry,
+                log_mktcap=log_mktcap,
+                orthogonalize=args.orthogonalize,
             )
         else:
             score = composite_score(close, volume, turnover,
-                                    factors=names, weights=weights)
+                                    factors=names, weights=weights,
+                                    winsorize=args.winsorize,
+                                    industry=industry,
+                                    log_mktcap=log_mktcap,
+                                    orthogonalize=args.orthogonalize)
     except ValueError as e:
         print(e)
         return
@@ -1102,6 +1150,14 @@ def build_parser():
                       help="IC 诊断用的前向收益期（默认 5 日）")
     p_fp.add_argument("--min-score", type=float, default=None,
                       help="合成分数下限（默认不设）")
+    p_fp.add_argument("--winsorize", action="store_true",
+                      help="每日分位缩尾（1%%/99%%）")
+    p_fp.add_argument("--neutralize", default="",
+                      help="中性化项，逗号分隔：industry,size")
+    p_fp.add_argument("--industry-file",
+                      help="行业分类 CSV（默认 data/meta/industry.csv）")
+    p_fp.add_argument("--orthogonalize", action="store_true",
+                      help="按 --factors 顺序逐日正交化后再合成")
     p_fp.add_argument("--capital", type=float, default=100000,
                       help="初始资金（默认 100000）")
     p_fp.add_argument("--no-limit", action="store_true",
