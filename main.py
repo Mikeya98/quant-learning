@@ -619,6 +619,73 @@ def cmd_portfolio(args):
     return result
 
 
+def cmd_factor_tune(args):
+    """IC 窗口的 walk-forward 样本外调参 (v0.20)"""
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.strategy.ic_tuning import (
+        format_tuning_report,
+        make_param_grid,
+        summarize_tuning,
+        walk_forward_tune,
+    )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("walk-forward 调参至少需要 5 只标的（横截面 IC 才有意义）")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    try:
+        periods = [int(x) for x in args.grid_periods.split(",") if x.strip()]
+        windows = [int(x) for x in args.grid_windows.split(",") if x.strip()]
+        grid = make_param_grid(periods, windows)
+    except ValueError as e:
+        print(f"参数网格有误: {e}")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    print(f"\nIC 窗口调参: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}")
+    print(f"网格: ic_period {periods} × ic_window {windows} "
+          f"= {len(grid)} 组; {args.folds} 折, {args.mode} 训练窗口")
+    print(f"挑选标准: 训练段 {args.criterion.upper()}; "
+          f"评估: {args.period} 日前向收益 RankIC")
+
+    try:
+        rows = walk_forward_tune(
+            close, grid,
+            n_folds=args.folds,
+            initial_train=args.initial_train,
+            mode=args.mode,
+            volume=volume,
+            turnover=turnover,
+            factors=names,
+            eval_period=args.period,
+            criterion=args.criterion,
+        )
+    except ValueError as e:
+        print(f"调参失败: {e}")
+        return
+
+    summary = summarize_tuning(rows)
+    print("\n" + format_tuning_report(rows, summary, criterion=args.criterion))
+
+    if summary["distinct_params"] > 1:
+        print("\n  注意: 参数在不同折之间跳变，说明训练段的最优窗口不稳定；")
+        print("  样本外提升要结合折数和数据长度看，只有 3 折时不足以定论。")
+
+    return rows
+
+
 def cmd_factor_portfolio(args):
     """多因子选股 → 组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1181,6 +1248,30 @@ def build_parser():
     p_fp.add_argument("--costs", action="store_true",
                       help="打印交易成本拆分")
 
+    # factor-tune 命令 (v0.20): IC 窗口 walk-forward 调参
+    p_ft = subparsers.add_parser("factor-tune",
+                                 help="IC 窗口的 walk-forward 样本外调参")
+    p_ft.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_ft.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_ft.add_argument("--grid-periods", default="5,10,20,40",
+                      help="待搜索的 ic_period 列表（默认 5,10,20,40）")
+    p_ft.add_argument("--grid-windows", default="20,40,60,120",
+                      help="待搜索的 ic_window 列表（默认 20,40,60,120）")
+    p_ft.add_argument("--folds", type=int, default=3,
+                      help="测试段个数（默认 3）")
+    p_ft.add_argument("--initial-train", type=float, default=0.5,
+                      help="第一个训练段占比（默认 0.5）")
+    p_ft.add_argument("--mode", choices=["expanding", "rolling"],
+                      default="expanding", help="训练窗口方式")
+    p_ft.add_argument("--criterion", choices=["ic", "icir", "t"],
+                      default="ic", help="训练段挑参数的标准（默认 IC）")
+    p_ft.add_argument("--period", type=int, default=5,
+                      help="评估 IC 用的前向收益期（默认 5 日）")
+    p_ft.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_ft.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -1218,6 +1309,8 @@ def main():
         cmd_portfolio(args)
     elif args.command == "factor":
         cmd_factor(args)
+    elif args.command == "factor-tune":
+        cmd_factor_tune(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":

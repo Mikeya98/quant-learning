@@ -142,9 +142,41 @@ def test_factor_portfolio_flags():
           "默认关闭所有预处理")
 
 
+def test_factor_tune_flags():
+    print("\n== factor-tune 参数 ==")
+    parser = cli.build_parser()
+
+    args = parser.parse_args([
+        "factor-tune",
+        "--symbols", "000001,000002,600036,600519,601318",
+        "--grid-periods", "5,20",
+        "--grid-windows", "40,120",
+        "--folds", "4",
+        "--mode", "rolling",
+        "--criterion", "icir",
+        "--initial-train", "0.6",
+    ])
+    check(args.command == "factor-tune", "命令识别")
+    check(args.grid_periods == "5,20" and args.grid_windows == "40,120",
+          "网格参数原样保留")
+    check(args.folds == 4 and args.mode == "rolling", "折数/模式传进参数表")
+    check(args.criterion == "icir", "挑选标准传进参数表")
+    check(abs(args.initial_train - 0.6) < 1e-12, "训练段占比传进参数表")
+
+    args2 = parser.parse_args([
+        "factor-tune", "--symbols", "000001,000002,600036,600519,601318",
+    ])
+    check(args2.folds == 3 and args2.mode == "expanding"
+          and args2.criterion == "ic",
+          "默认 3 折 / expanding / IC")
+    check(args2.grid_periods == "5,10,20,40", "默认周期网格")
+    check(args2.period == 5, "默认评估期 5 日")
+
+
 def main():
     test_portfolio_cli_wiring()
     test_factor_portfolio_flags()
+    test_factor_tune_flags()
     print("\n" + "=" * 40)
     print(f"  {PASS} passed, {FAIL} failed")
     print("=" * 40)
