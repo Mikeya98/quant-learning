@@ -173,10 +173,58 @@ def test_factor_tune_flags():
     check(args2.period == 5, "默认评估期 5 日")
 
 
+def test_factor_sensitivity_flags():
+    print("\n== factor-sensitivity 参数 ==")
+    parser = cli.build_parser()
+
+    args = parser.parse_args([
+        "factor-sensitivity",
+        "--symbols", "000001,000002,600036,600519,601318",
+        "--horizons", "1,5,20",
+        "--lookbacks", "5,20",
+        "--kind", "reversal",
+        "--segments", "3",
+        "--stability-horizon", "10",
+    ])
+    check(args.command == "factor-sensitivity", "命令识别")
+    check(args.horizons == "1,5,20" and args.lookbacks == "5,20",
+          "horizon/lookback 原样保留")
+    check(args.kind == "reversal", "因子方向传进参数表")
+    check(args.segments == 3 and args.stability_horizon == 10,
+          "分段/稳定性期限传进参数表")
+
+    args2 = parser.parse_args([
+        "factor-sensitivity", "--symbols", "000001,000002,600036,600519,601318",
+    ])
+    check(args2.horizons == "1,3,5,10,20", "默认评估期限")
+    check(args2.lookbacks == "5,10,20,40,60", "默认信号期限")
+    check(args2.kind == "momentum" and args2.segments == 4,
+          "默认动量方向 / 4 段")
+
+    # 端到端跑一遍（数据用假行情，只验证接线和输出）
+    buf = io.StringIO()
+    old_load = cli.load_csv
+    cli.load_csv = lambda symbol, processed=True: fake_data()
+    try:
+        args3 = parser.parse_args([
+            "factor-sensitivity",
+            "--symbols", "600000,600519,000001,000002,601318",
+            "--horizons", "1,5", "--lookbacks", "5,20",
+        ])
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_factor_sensitivity(args3)
+    finally:
+        cli.load_csv = old_load
+    out = buf.getvalue()
+    check("IC 期限敏感性" in out and "Newey-West" in out,
+          "cmd_factor_sensitivity 输出完整报告")
+
+
 def main():
     test_portfolio_cli_wiring()
     test_factor_portfolio_flags()
     test_factor_tune_flags()
+    test_factor_sensitivity_flags()
     print("\n" + "=" * 40)
     print(f"  {PASS} passed, {FAIL} failed")
     print("=" * 40)

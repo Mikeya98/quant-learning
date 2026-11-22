@@ -686,6 +686,90 @@ def cmd_factor_tune(args):
     return rows
 
 
+def cmd_factor_sensitivity(args):
+    """IC 期限敏感性: 信号期限 × 评估期限 (v0.21)"""
+    from src.analysis.factor_research import compute_forward_returns, make_factors
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.analysis.ic_sensitivity import (
+        analyze_grid,
+        analyze_horizons,
+        format_sensitivity_report,
+        ic_stats,
+        sign_consistency,
+        subperiod_ic,
+    )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("期限敏感性至少需要 5 只标的（横截面 IC 才有意义）")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    def _ints(text, name):
+        try:
+            vals = [int(x) for x in text.split(",") if x.strip()]
+        except ValueError:
+            raise ValueError(f"{name} 必须是逗号分隔的整数")
+        if not vals or any(v <= 0 for v in vals):
+            raise ValueError(f"{name} 必须是正整数")
+        return vals
+
+    try:
+        horizons = _ints(args.horizons, "--horizons")
+        lookbacks = _ints(args.lookbacks, "--lookbacks")
+    except ValueError as e:
+        print(f"参数有误: {e}")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    print(f"\nIC 期限敏感性: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}")
+    print(f"评估期限: {horizons} 日; 信号期限: {lookbacks} 日 "
+          f"({args.kind})")
+
+    try:
+        horizon_stats = analyze_horizons(
+            close, factors=names, horizons=horizons,
+            volume=volume, turnover=turnover,
+        )
+        grid_stats = analyze_grid(
+            close, lookbacks=lookbacks, horizons=horizons, kind=args.kind,
+        )
+    except ValueError as e:
+        print(f"计算失败: {e}")
+        return
+
+    # 分段稳定性: 每个因子在固定的评估期限上切 args.segments 段
+    library = make_factors(close, volume=volume, turnover=turnover)
+    fwd_eval = compute_forward_returns(close, periods=args.stability_horizon)
+    stability = {}
+    for name in names:
+        segs = subperiod_ic(library[name], fwd_eval,
+                            n_segments=args.segments)
+        full = ic_stats(library[name], fwd_eval,
+                        nw_lags=args.stability_horizon - 1).mean_ic
+        stability[name] = {
+            "full": full,
+            "segments": segs,
+            "consistency": sign_consistency(segs, full),
+        }
+
+    print("\n" + format_sensitivity_report(
+        horizon_stats, grid_stats, lookbacks, horizons,
+        stability=stability, kind=args.kind,
+    ))
+    return horizon_stats, grid_stats, stability
+
+
 def cmd_factor_portfolio(args):
     """多因子选股 → 组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1272,6 +1356,28 @@ def build_parser():
     p_ft.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_ft.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
 
+    # factor-sensitivity 命令 (v0.21): IC 期限敏感性
+    p_fs = subparsers.add_parser(
+        "factor-sensitivity",
+        help="IC 期限敏感性：信号期限 × 评估期限 + Newey-West t",
+    )
+    p_fs.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_fs.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_fs.add_argument("--horizons", default="1,3,5,10,20",
+                      help="评估期限（未来 N 日收益），默认 1,3,5,10,20")
+    p_fs.add_argument("--lookbacks", default="5,10,20,40,60",
+                      help="信号期限（因子回看 N 日），默认 5,10,20,40,60")
+    p_fs.add_argument("--kind", choices=["momentum", "reversal"],
+                      default="momentum", help="矩阵用动量还是反转方向")
+    p_fs.add_argument("--segments", type=int, default=4,
+                      help="分段稳定性切几段（默认 4）")
+    p_fs.add_argument("--stability-horizon", type=int, default=5,
+                      help="稳定性检查用的评估期限（默认 5 日）")
+    p_fs.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fs.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -1311,6 +1417,8 @@ def main():
         cmd_factor(args)
     elif args.command == "factor-tune":
         cmd_factor_tune(args)
+    elif args.command == "factor-sensitivity":
+        cmd_factor_sensitivity(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":
