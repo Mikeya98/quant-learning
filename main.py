@@ -770,6 +770,76 @@ def cmd_factor_sensitivity(args):
     return horizon_stats, grid_stats, stability
 
 
+def cmd_factor_inference(args):
+    """IC 显著性：Newey-West vs block bootstrap (v0.22)"""
+    from src.analysis.factor_research import (
+        compute_forward_returns,
+        compute_ic,
+        make_factors,
+    )
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.analysis.ic_inference import (
+        compare_inference,
+        format_inference_report,
+    )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("IC 推断至少需要 5 只标的（横截面 IC 才有意义）")
+        return
+
+    try:
+        horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
+    except ValueError:
+        print("--horizons 必须是逗号分隔的整数")
+        return
+    if not horizons or any(h <= 0 for h in horizons):
+        print("--horizons 必须是正整数")
+        return
+    if args.n_boot <= 0:
+        print("--n-boot 必须是正整数")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    library = make_factors(close, volume=volume, turnover=turnover)
+    unknown = [n for n in names if n not in library]
+    if unknown:
+        print(f"未知因子: {', '.join(unknown)}")
+        return
+
+    print(f"\nIC 显著性对照: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}")
+    print(f"评估期限: {horizons} 日; bootstrap: {args.method}, "
+          f"{args.n_boot} 次, seed={args.seed}")
+
+    results = {}
+    for name in names:
+        for h in horizons:
+            fwd = compute_forward_returns(close, periods=h)
+            ic = compute_ic(library[name], fwd).ic_series.dropna()
+            results[(name, h)] = compare_inference(
+                ic,
+                lags=h - 1,
+                block_size=args.block_size if args.block_size > 0 else h,
+                n_boot=args.n_boot,
+                seed=args.seed,
+                method=args.method,
+            )
+
+    print("\n" + format_inference_report(results, names, horizons))
+    return results
+
+
 def cmd_factor_portfolio(args):
     """多因子选股 → 组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1378,6 +1448,27 @@ def build_parser():
     p_fs.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_fs.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
 
+    # factor-inference 命令 (v0.22): Newey-West vs block bootstrap
+    p_fi = subparsers.add_parser(
+        "factor-inference",
+        help="IC 显著性：Newey-West t 与 block bootstrap 对照",
+    )
+    p_fi.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_fi.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_fi.add_argument("--horizons", default="1,3,5,10,20",
+                      help="评估期限（未来 N 日收益），默认 1,3,5,10,20")
+    p_fi.add_argument("--n-boot", type=int, default=2000,
+                      help="bootstrap 重采样次数（默认 2000）")
+    p_fi.add_argument("--block-size", type=int, default=0,
+                      help="块长；0 表示用评估期限 horizon")
+    p_fi.add_argument("--method", choices=["circular", "stationary"],
+                      default="circular", help="块 bootstrap 方式")
+    p_fi.add_argument("--seed", type=int, default=0, help="随机种子")
+    p_fi.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fi.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -1419,6 +1510,8 @@ def main():
         cmd_factor_tune(args)
     elif args.command == "factor-sensitivity":
         cmd_factor_sensitivity(args)
+    elif args.command == "factor-inference":
+        cmd_factor_inference(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":

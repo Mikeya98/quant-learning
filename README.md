@@ -27,6 +27,7 @@
 - **因子正交化与中性化预处理**：合成之前可以按 `--factors` 的顺序逐日做横截面正交化——后面的因子对前面已经取过残差的因子回归，只保留别人没解释掉的部分，避免相关因子重复计权。也可以接入缩尾、行业去均值、市值回归残差（`--winsorize / --neutralize industry,size`），IC 加权时在预处理后的因子上估计 IC，保证"估计用的因子"和"打分的因子"是同一个。实测 25 只 2019-2024：原始动量/反转的相关是 -0.46，正交化后降到 0；波动率的市值暴露 +0.43，市值中性化后降到 0
 - **IC 参数 walk-forward 调参**：`factor-tune` 把时间轴切成训练/测试折，每折只在训练段上按 IC/ICIR/t 从网格里挑 `ic_period` 和 `ic_window`，原样用到测试段，再和固定参数逐折对比。实测 25 只 2019-2024，训练段 IC 全在 +0.02~+0.05，样本外平均 -0.039（固定参数 -0.009），逐折胜出 1/3——在这组数据上调参没有打过固定参数，文章里把原因和切法都写清楚了
 - **IC 期限敏感性**：`factor-sensitivity` 同时扫两个期限——信号期限（因子回看多少天）和评估期限（IC 对未来多少天收益算），输出两张表：因子 × 评估期限的平均 RankIC、momentum 的信号期限 × 评估期限矩阵，并给出分段稳定性。重叠的前向收益会让普通 t 值虚高，所以每个 horizon 都用 lag=H-1 的 Newey-West 修正后再看显著性。实测 25 只 2019-2024：`vol_20` 在 20 日收益上普通 t=-5.39，修正后只剩 -1.51；`momentum_20` 的 5 日 t 从 -2.86 收缩到 -1.68。信号期限扫过去最优值在 5/10/20/40/60 之间跳，没有稳定窗口
+- **IC 显著性推断**：`factor-inference` 用 block bootstrap（circular / stationary，块长取评估期限）和 Newey-West 对照。两者在这组数据上算出的 t 值几乎相同（`vol_20` 20 日都是 -1.51），bootstrap 另外给出 95% 置信区间：`momentum_20` 只有 1 日和 3 日的区间完全在 0 以下，5 日以上跨 0
 
 ## 目录
 
@@ -311,6 +312,33 @@ python main.py factor-sensitivity --symbols 000001,000651,... \
 
 代码在 `src/analysis/ic_sensitivity.py`，Newey-West 使用 Bartlett 核，lag 默认取评估期限减一。
 
+## IC 显著性：Newey-West vs block bootstrap
+
+Newey-West 是解析近似，lag 要自己选。`factor-inference` 加了一个不依赖解析公式的对照：把 IC 序列按块重采样（circular 或 stationary），块长取评估期限，从重采样均值里直接算标准误、t 值和百分位置信区间。
+
+```bash
+python main.py factor-inference --symbols 000001,000651,... \
+    --horizons 1,3,5,10,20 --n-boot 2000
+```
+
+25 只股票、2019—2024：
+
+```
+  因子              h   mean_IC  t_naive    t_NW   t_boot  boot_SE                95% CI
+  momentum_20     1   -0.0169    -2.00   -2.00    -2.01   0.0084     [-0.0341,-0.0008]
+  momentum_20     3   -0.0244    -2.95   -2.12    -2.06   0.0119     [-0.0468,-0.0007]
+  momentum_20     5   -0.0237    -2.86   -1.68    -1.67   0.0142     [-0.0515,+0.0048]
+  momentum_20    10   -0.0173    -2.15   -0.94    -0.91   0.0190     [-0.0537,+0.0199]
+  momentum_20    20   -0.0178    -2.20   -0.72    -0.73   0.0242     [-0.0648,+0.0287]
+  reversal_5      1    0.0243     3.04    3.04     3.06   0.0079     [+0.0076,+0.0398]
+  reversal_5      5    0.0135     1.75    1.12     1.12   0.0121     [-0.0108,+0.0356]
+  vol_20         20   -0.0552    -5.39   -1.51    -1.51   0.0366     [-0.1275,+0.0151]
+```
+
+两种修正的 t 值几乎一样（`vol_20` 20 日都是 -1.51，`momentum_20` 5 日 -1.68 vs -1.67），说明在这里 Newey-West 的 Bartlett 核和块重采样估出来的长期方差一致。差别在于 bootstrap 还给了置信区间：`momentum_20` 只有 1 日、3 日的 95% CI 完全在 0 以下，5 日以上都跨 0。
+
+代码在 `src/analysis/ic_inference.py`，circular 按固定块长重采样，stationary 用几何分布的块长。bootstrap 修的是时间自相关，修不了样本量；25 只股票的横截面仍然太小。
+
 ## 测试
 
 ```bash
@@ -323,6 +351,7 @@ python tests/test_metrics.py            # beta/alpha/跟踪误差/信息比率, 
 python tests/test_costs.py              # 交易成本四项拆分 + 汇总 + 空表兼容, 45 项
 python tests/test_ic_tuning.py          # walk-forward 切分、调参、无未来信息, 50 项
 python tests/test_ic_sensitivity.py     # Newey-West、期限扫描、分段稳定性, 54 项
+python tests/test_ic_inference.py       # block bootstrap、SE/CI、与 NW 对照, 40 项
 python main.py --help                   # 所有命令
 ```
 

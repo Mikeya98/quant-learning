@@ -220,11 +220,42 @@ def test_factor_sensitivity_flags():
           "cmd_factor_sensitivity 输出完整报告")
 
 
+def test_factor_inference_flags():
+    print("\n== factor-inference CLI ==")
+    parser = cli.build_parser()
+
+    args = parser.parse_args([
+        "factor-inference", "--symbols", "000001,000002,600036,600519,601318",
+    ])
+    check(args.horizons == "1,3,5,10,20", "默认评估期限")
+    check(args.n_boot == 2000 and args.seed == 0, "默认 bootstrap 次数/种子")
+    check(args.block_size == 0, "默认块长跟随 horizon")
+    check(args.method == "circular", "默认 circular")
+
+    buf = io.StringIO()
+    old_load = cli.load_csv
+    cli.load_csv = lambda symbol, processed=True: fake_data()
+    try:
+        args2 = parser.parse_args([
+            "factor-inference",
+            "--symbols", "600000,600519,000001,000002,601318",
+            "--horizons", "1,5", "--n-boot", "50",
+        ])
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_factor_inference(args2)
+    finally:
+        cli.load_csv = old_load
+    out = buf.getvalue()
+    check("block bootstrap" in out and "t_NW" in out,
+          "cmd_factor_inference 输出完整报告")
+
+
 def main():
     test_portfolio_cli_wiring()
     test_factor_portfolio_flags()
     test_factor_tune_flags()
     test_factor_sensitivity_flags()
+    test_factor_inference_flags()
     print("\n" + "=" * 40)
     print(f"  {PASS} passed, {FAIL} failed")
     print("=" * 40)
