@@ -27,16 +27,21 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.analysis.block_length import politi_white_block_length
 from src.analysis.ic_sensitivity import newey_west_tstat
 
 __all__ = [
     "BootstrapStats",
     "InferenceComparison",
+    "CoverageResult",
     "circular_block_resample",
     "stationary_block_resample",
     "block_bootstrap_mean",
+    "bootstrap_se_curve",
+    "coverage_simulation",
     "compare_inference",
     "format_inference_report",
+    "format_coverage_report",
 ]
 
 
@@ -121,6 +126,7 @@ class BootstrapStats:
     n_boot: int
     block_size: float
     method: str
+    block_source: str = "fixed"     # fixed / horizon / pw-sb / pw-cb
 
     def __repr__(self) -> str:
         return (f"BootstrapStats(mean={self.mean:.4f}, se={self.se:.4f}, "
@@ -141,6 +147,7 @@ def block_bootstrap_mean(
     seed: int = 0,
     method: str = "circular",
     ci: float = 0.95,
+    block_source: str = "fixed",
 ) -> BootstrapStats:
     """
     对均值做块 bootstrap。
@@ -151,6 +158,7 @@ def block_bootstrap_mean(
                  调用方一般直接传 horizon。
     method     : "circular" | "stationary"
     ci         : 百分位置信区间水平
+    block_source : 块长来源标记，只用于报告（fixed / horizon / pw-sb / pw-cb）
     """
     if method not in ("circular", "stationary"):
         raise ValueError("method must be 'circular' or 'stationary'")
@@ -197,7 +205,41 @@ def block_bootstrap_mean(
         n_boot=int(n_boot),
         block_size=L,
         method=method,
+        block_source=block_source,
     )
+
+
+def bootstrap_se_curve(
+    values: Sequence[float],
+    block_sizes: Sequence[float] = (1, 2, 5, 10, 20, 40),
+    *,
+    n_boot: int = 2000,
+    seed: int = 0,
+    method: str = "circular",
+    ci: float = 0.95,
+) -> list:
+    """
+    扫一组块长，返回每个块长下的 SE / t / 置信区间。
+
+    用来回答"块长到底要多长"。正自相关时，块长从 1 加到自相关的
+    尺度上，SE 会明显上升，之后趋于平台 —— 平台起点就是自相关被
+    覆盖的位置。序列近似白噪声或 lag-1 为负时，SE 对块长不敏感，
+    甚至随 L 缓慢下降（块越长、有效样本越少）。
+    """
+    rows = []
+    for L in block_sizes:
+        st = block_bootstrap_mean(
+            values, block_size=L, n_boot=n_boot, seed=seed,
+            method=method, ci=ci,
+        )
+        rows.append({
+            "block_size": float(L),
+            "se": st.se,
+            "t": st.t_stat,
+            "ci_low": st.ci_low,
+            "ci_high": st.ci_high,
+        })
+    return rows
 
 
 @dataclass
@@ -210,10 +252,15 @@ class InferenceComparison:
     t_nw: float            # Newey-West，lag 由调用方给
     lags: int
     boot: BootstrapStats
+    block_source: str = "horizon"
 
     @property
     def t_boot(self) -> float:
         return self.boot.t_stat
+
+    @property
+    def block_length(self) -> float:
+        return self.boot.block_size
 
     @property
     def boot_se(self) -> float:
@@ -230,6 +277,7 @@ def compare_inference(
     *,
     lags: int,
     block_size: Optional[float] = None,
+    block_method: str = "horizon",
     n_boot: int = 2000,
     seed: int = 0,
     method: str = "circular",
@@ -238,8 +286,10 @@ def compare_inference(
     """
     对一段 IC 序列同时算普通 t、Newey-West t 和 block bootstrap。
 
-    lags       : Newey-West 的滞后阶数，重叠收益一般取 horizon - 1
-    block_size : bootstrap 块长，None 时取 lags + 1（即 horizon）
+    lags         : Newey-West 的滞后阶数，重叠收益一般取 horizon - 1
+    block_size   : bootstrap 块长，给定时优先；None 时看 block_method
+    block_method : "horizon"（取 lags+1，即评估期限）
+                   "pw-sb" / "pw-cb"（Politis-White 自适应块长）
     """
     x = _clean(values)
     n = x.size
@@ -253,9 +303,24 @@ def compare_inference(
         t_naive = 0.0
         t_nw = 0.0
 
-    L = block_size if block_size is not None else float(max(1, int(lags) + 1))
+    if block_size is not None:
+        L = float(block_size)
+        source = "fixed"
+    elif block_method in ("pw-sb", "pw-cb"):
+        pw = politi_white_block_length(
+            x, method="stationary" if block_method == "pw-sb" else "circular",
+        )
+        L = pw.b_sb if block_method == "pw-sb" else pw.b_cb
+        source = block_method
+    elif block_method == "horizon":
+        L = float(max(1, int(lags) + 1))
+        source = "horizon"
+    else:
+        raise ValueError("block_method must be 'horizon', 'pw-sb' or 'pw-cb'")
+
     boot = block_bootstrap_mean(
         x, block_size=L, n_boot=n_boot, seed=seed, method=method, ci=ci,
+        block_source=source,
     )
 
     return InferenceComparison(
@@ -265,7 +330,130 @@ def compare_inference(
         t_nw=float(t_nw),
         lags=int(lags),
         boot=boot,
+        block_source=source,
     )
+
+
+# ===================================================================
+# 覆盖率模拟：块长选得对不对，用已知真值的合成数据检验
+# ===================================================================
+
+@dataclass
+class CoverageResult:
+    """一次覆盖率模拟的结果"""
+
+    rho: float
+    n: int
+    reps: int
+    n_boot: int
+    rows: list              # [{"label", "mean_block", "coverage"}, ...]
+
+    def __repr__(self) -> str:
+        return (f"CoverageResult(rho={self.rho}, n={self.n}, "
+                f"reps={self.reps}, rows={len(self.rows)})")
+
+
+def coverage_simulation(
+    *,
+    rho: float = 0.5,
+    n: int = 800,
+    reps: int = 120,
+    n_boot: int = 300,
+    block_sizes: Sequence[Optional[float]] = (1, 5, 10, 20, None),
+    method: str = "circular",
+    seed: int = 0,
+    ci: float = 0.95,
+) -> CoverageResult:
+    """
+    用已知均值为 0 的 AR(1) 序列检验置信区间的覆盖率。
+
+    真值是 0，所以"0 落在 95% 区间里"就是一次正确覆盖。理想情况下
+    覆盖率应该接近 95%。块长太短会丢掉正自相关、区间偏窄、覆盖率
+    掉到 80% 以下；块长太长会让重采样均值过于平滑、覆盖率也会偏。
+
+    block_sizes 里的 None 表示"每个样本用 Politis-White 自己选"，
+    选法与 bootstrap 的抽样方式一致（circular → pw-cb）。
+    另外附上普通 t 和 Newey-West（lag = 块长）的覆盖率作对照。
+    """
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must be in [0, 1)")
+    if n < 32 or reps < 10 or n_boot < 50:
+        raise ValueError("n >= 32, reps >= 10, n_boot >= 50 required")
+
+    rng = np.random.default_rng(seed)
+    eps = rng.standard_normal((reps, n))
+    x = np.empty((reps, n))
+    x[:, 0] = eps[:, 0] / np.sqrt(1.0 - rho * rho) if rho > 0 else eps[:, 0]
+    for t in range(1, n):
+        x[:, t] = rho * x[:, t - 1] + eps[:, t]
+
+    # 每个样本的 PW 块长只算一次，所有用到 None 的行共用
+    pw = [
+        politi_white_block_length(
+            x[r], method="stationary" if method == "stationary" else "circular",
+        ).block_size
+        for r in range(reps)
+    ]
+
+    rows = []
+    for L in block_sizes:
+        covered = 0
+        lengths = []
+        for r in range(reps):
+            Lr = pw[r] if L is None else float(L)
+            lengths.append(Lr)
+            st = block_bootstrap_mean(
+                x[r], block_size=Lr, n_boot=n_boot, seed=seed + r,
+                method=method, ci=ci,
+            )
+            if st.ci_low <= 0.0 <= st.ci_high:
+                covered += 1
+        rows.append({
+            "label": "PW 自适应" if L is None else f"L={int(L)}",
+            "mean_block": float(np.mean(lengths)),
+            "coverage": covered / reps,
+        })
+
+    # 解析区间对照：普通 t 和 Newey-West，lag 取 PW 对应块长
+    naive_cov = nw_cov = 0
+    z = 1.959963984540054
+    for r in range(reps):
+        seq = x[r]
+        mean = float(seq.mean())
+        std = float(seq.std(ddof=1))
+        se = std / np.sqrt(n)
+        if se > 0 and abs(mean / se) <= z:
+            naive_cov += 1
+        nw_t = newey_west_tstat(seq, max(0, int(round(pw[r])) - 1))
+        if abs(nw_t) <= z:
+            nw_cov += 1
+    rows.append({"label": "普通 t", "mean_block": 1.0,
+                 "coverage": naive_cov / reps})
+    rows.append({"label": "Newey-West", "mean_block": float(np.mean(pw)),
+                 "coverage": nw_cov / reps})
+
+    return CoverageResult(rho=rho, n=n, reps=reps, n_boot=n_boot, rows=rows)
+
+
+def format_coverage_report(result: CoverageResult,
+                           nominal: float = 0.95) -> str:
+    """把覆盖率模拟摊成表，顺手标出明显偏离名义水平的行。"""
+    lines = ["=" * 60, "  95% 置信区间覆盖率（AR(1)，真均值 = 0）", "=" * 60, ""]
+    lines.append(f"  rho = {result.rho}, n = {result.n}, "
+                 f"reps = {result.reps}, n_boot = {result.n_boot}")
+    lines.append(f"  名义覆盖率 = {nominal:.0%}；偏离超过 3 个百分点标 !")
+    lines.append("")
+    lines.append(f"  {'方法':<12}{'平均块长':>10}{'覆盖率':>10}   ")
+    lines.append("  " + "-" * 40)
+    for row in result.rows:
+        flag = " !" if abs(row["coverage"] - nominal) > 0.03 else ""
+        lines.append(f"  {row['label']:<12}{row['mean_block']:>10.1f}"
+                     f"{row['coverage']:>9.1%}{flag}")
+    lines.append("")
+    lines.append("  读法: 块长 1 丢掉正自相关，区间偏窄，覆盖率系统性偏低；")
+    lines.append("        PW 自适应块长把覆盖率拉回名义水平附近。")
+    lines.append("=" * 60)
+    return "\n".join(lines)
 
 
 # ===================================================================
@@ -283,9 +471,9 @@ def format_inference_report(
     lines = ["=" * 78, f"  {title}", "=" * 78, ""]
     lines.append(
         f"  {'因子':<14}{'h':>3}{'mean_IC':>10}{'t_naive':>9}"
-        f"{'t_NW':>8}{'t_boot':>9}{'boot_SE':>9}{'95% CI':>22}"
+        f"{'t_NW':>8}{'L':>6}{'t_boot':>9}{'boot_SE':>9}{'95% CI':>22}"
     )
-    lines.append("  " + "-" * 74)
+    lines.append("  " + "-" * 80)
 
     for name in factors:
         for h in horizons:
@@ -295,7 +483,8 @@ def format_inference_report(
             ci = f"[{r.boot.ci_low:+.4f},{r.boot.ci_high:+.4f}]"
             lines.append(
                 f"  {name:<14}{h:>3}{r.mean:>10.4f}{r.t_naive:>9.2f}"
-                f"{r.t_nw:>8.2f}{r.t_boot:>9.2f}{r.boot_se:>9.4f}{ci:>22}"
+                f"{r.t_nw:>8.2f}{r.boot.block_size:>6.0f}{r.t_boot:>9.2f}"
+                f"{r.boot_se:>9.4f}{ci:>22}"
             )
 
     lines.append("")
@@ -303,6 +492,8 @@ def format_inference_report(
     lines.append("  - t_naive 把重叠样本当独立样本，期限越长越不可信。")
     lines.append("  - t_NW 和 t_boot 都修了时间自相关；两者差距大时说明")
     lines.append("    lag/块长选得不合适，别只挑一个顺眼的看。")
+    lines.append("  - L 是 bootstrap 实际块长；block_method=pw-sb/pw-cb 时")
+    lines.append("    由 Politis-White 按序列自身自相关自动选择。")
     lines.append("  - 95% CI 跨过 0，基本可以当作这条因子在这组数据上")
     lines.append("    没有可辨识的方向。")
     lines.append("=" * 78)

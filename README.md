@@ -28,6 +28,7 @@
 - **IC 参数 walk-forward 调参**：`factor-tune` 把时间轴切成训练/测试折，每折只在训练段上按 IC/ICIR/t 从网格里挑 `ic_period` 和 `ic_window`，原样用到测试段，再和固定参数逐折对比。实测 25 只 2019-2024，训练段 IC 全在 +0.02~+0.05，样本外平均 -0.039（固定参数 -0.009），逐折胜出 1/3——在这组数据上调参没有打过固定参数，文章里把原因和切法都写清楚了
 - **IC 期限敏感性**：`factor-sensitivity` 同时扫两个期限——信号期限（因子回看多少天）和评估期限（IC 对未来多少天收益算），输出两张表：因子 × 评估期限的平均 RankIC、momentum 的信号期限 × 评估期限矩阵，并给出分段稳定性。重叠的前向收益会让普通 t 值虚高，所以每个 horizon 都用 lag=H-1 的 Newey-West 修正后再看显著性。实测 25 只 2019-2024：`vol_20` 在 20 日收益上普通 t=-5.39，修正后只剩 -1.51；`momentum_20` 的 5 日 t 从 -2.86 收缩到 -1.68。信号期限扫过去最优值在 5/10/20/40/60 之间跳，没有稳定窗口
 - **IC 显著性推断**：`factor-inference` 用 block bootstrap（circular / stationary，块长取评估期限）和 Newey-West 对照。两者在这组数据上算出的 t 值几乎相同（`vol_20` 20 日都是 -1.51），bootstrap 另外给出 95% 置信区间：`momentum_20` 只有 1 日和 3 日的区间完全在 0 以下，5 日以上跨 0
+- **块长自动选择**：`factor-blocklength` 用 Politis-White (2004) 从 IC 序列自身的自相关估最优块长——隐含假设检验找 m_hat、平顶核估 G、代入 `(2G²/(cσ⁴)·n)^(1/3)`，分别给平稳/环形 bootstrap 的块长。`factor-inference --block-method pw-sb/pw-cb` 直接改用这个块长。实测 25 只 2019-2024：1 日 horizon 的 ρ1 只有 -0.05，块长选 1；20 日 horizon 的 ρ1 到 0.72~0.93，块长顶到上限 113。块长从 horizon 换成 PW 后，多日 horizon 的 SE 大 1%~19%，显著性的结论不变（仍全部跨 0）；覆盖率模拟显示块长 1 在 ρ=0.7 时 95% 区间只覆盖 56%，PW 把覆盖率拉回 92%
 
 ## 目录
 
@@ -339,6 +340,36 @@ python main.py factor-inference --symbols 000001,000651,... \
 
 代码在 `src/analysis/ic_inference.py`，circular 按固定块长重采样，stationary 用几何分布的块长。bootstrap 修的是时间自相关，修不了样本量；25 只股票的横截面仍然太小。
 
+## 块长怎么选：Politis-White 自动块长
+
+上一篇的块长取评估期限，是个假设。`factor-blocklength` 把它交给数据：算样本自相关，找连续不显著的起点 m_hat，用平顶核估 `G = Σ h(k/M)|k|γ(k)`，再代入 `b_opt = (2G²/(cσ⁴)·n)^(1/3)`。平稳 bootstrap 取 c=2，环形取 c=4/3（PW 2009 修正）。
+
+```bash
+python main.py factor-blocklength --symbols 000001,000651,... \
+    --horizons 1,3,5,10,20 --curve --simulate
+python main.py factor-inference --symbols 000001,000651,... \
+    --horizons 1,5,20 --block-method pw-sb
+```
+
+25 只股票、2019—2024 的块长表：
+
+```
+  因子              h     n m_hat    M   b_SB   b_CB    rho1    rho5   rho20
+  momentum_20     1  1435     0    0    1.0    1.0  -0.053  -0.037  -0.004
+  momentum_20     5  1431     6   12   11.9   13.6   0.701  -0.107   0.028
+  momentum_20    20  1416    12   24  113.0  113.0   0.876   0.514  -0.047
+  reversal_5      1  1450     0    0    1.0    1.0  -0.039   0.021  -0.001
+  reversal_5     20  1431     4    8   35.0   40.1   0.720  -0.038   0.002
+  vol_20          1  1435     0    0    1.0    1.0  -0.029   0.011   0.029
+  vol_20         20  1416    18   36  113.0  113.0   0.933   0.702   0.030
+```
+
+1 日 horizon 基本是白噪声（ρ1 约 -0.05），块长 1；多日 horizon 的自相关很强，20 日 horizon 顶到 b_max=113。块长从 horizon 换成 PW 后，`reversal_5` 5 日的 t 从 1.12 收到 0.96、`vol_20` 5 日从 -0.44 收到 -0.37，其余变化更小，结论不变（置信区间跨 0）。
+
+覆盖率模拟用已知均值为 0 的 AR(1) 检验区间是否可信：ρ=0.7 时块长 1 的 95% 区间只覆盖 56%，PW 自适应块长覆盖 92%，和 Newey-West 相当。剩下的 3 个百分点是百分位 bootstrap 的有限样本欠覆盖。
+
+代码在 `src/analysis/block_length.py`。PW 也有边界：样本短时块长被 b_max 截断，负自相关会让块长对 horizon 不单调，这两点在文章里都留了记录。
+
 ## 测试
 
 ```bash
@@ -352,6 +383,7 @@ python tests/test_costs.py              # 交易成本四项拆分 + 汇总 + �
 python tests/test_ic_tuning.py          # walk-forward 切分、调参、无未来信息, 50 项
 python tests/test_ic_sensitivity.py     # Newey-West、期限扫描、分段稳定性, 54 项
 python tests/test_ic_inference.py       # block bootstrap、SE/CI、与 NW 对照, 40 项
+python tests/test_block_length.py       # 自相关、m_hat、PW 块长、覆盖率模拟, 45 项
 python main.py --help                   # 所有命令
 ```
 

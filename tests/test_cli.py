@@ -250,12 +250,48 @@ def test_factor_inference_flags():
           "cmd_factor_inference 输出完整报告")
 
 
+def test_factor_blocklength_flags():
+    print("\n== factor-blocklength CLI ==")
+    parser = cli.build_parser()
+
+    args = parser.parse_args([
+        "factor-blocklength", "--symbols", "000001,000002,600036,600519,601318",
+    ])
+    check(args.horizons == "1,5,20", "默认评估期限")
+    check(args.simulate is False and args.curve is False,
+          "默认不跑模拟/曲线")
+    check(args.rho == 0.5 and args.sim_n == 800,
+          "默认模拟参数")
+
+    args2 = parser.parse_args([
+        "factor-blocklength", "--symbols", "000001,000002,600036,600519,601318",
+        "--horizons", "1,5", "--curve", "--simulate",
+        "--sim-n", "200", "--sim-reps", "10", "--n-boot", "100",
+    ])
+    check(args2.curve and args2.simulate, "开关参数解析")
+
+    buf = io.StringIO()
+    old_load = cli.load_csv
+    cli.load_csv = lambda symbol, processed=True: fake_data()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cli.cmd_factor_blocklength(args2)
+    finally:
+        cli.load_csv = old_load
+    out = buf.getvalue()
+    check("Politis-White" in out and "b_SB" in out and "b_CB" in out,
+          "cmd_factor_blocklength 输出块长表")
+    check("块长-SE 曲线" in out, "curve 输出")
+    check("覆盖率" in out and "PW 自适应" in out, "simulate 输出")
+
+
 def main():
     test_portfolio_cli_wiring()
     test_factor_portfolio_flags()
     test_factor_tune_flags()
     test_factor_sensitivity_flags()
     test_factor_inference_flags()
+    test_factor_blocklength_flags()
     print("\n" + "=" * 40)
     print(f"  {PASS} passed, {FAIL} failed")
     print("=" * 40)

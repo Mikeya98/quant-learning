@@ -830,7 +830,8 @@ def cmd_factor_inference(args):
             results[(name, h)] = compare_inference(
                 ic,
                 lags=h - 1,
-                block_size=args.block_size if args.block_size > 0 else h,
+                block_size=args.block_size if args.block_size > 0 else None,
+                block_method=args.block_method,
                 n_boot=args.n_boot,
                 seed=args.seed,
                 method=args.method,
@@ -838,6 +839,108 @@ def cmd_factor_inference(args):
 
     print("\n" + format_inference_report(results, names, horizons))
     return results
+
+
+def cmd_factor_blocklength(args):
+    """Politis-White 自动块长 (v0.23)"""
+    from src.analysis.factor_research import (
+        compute_forward_returns,
+        compute_ic,
+        make_factors,
+    )
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.analysis.block_length import (
+        politi_white_block_length,
+        sample_acf,
+    )
+    from src.analysis.ic_inference import (
+        bootstrap_se_curve,
+        coverage_simulation,
+        format_coverage_report,
+    )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("IC 推断至少需要 5 只标的（横截面 IC 才有意义）")
+        return
+
+    try:
+        horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
+    except ValueError:
+        print("--horizons 必须是逗号分隔的整数")
+        return
+    if not horizons or any(h <= 0 for h in horizons):
+        print("--horizons 必须是正整数")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+    library = make_factors(close, volume=volume, turnover=turnover)
+    unknown = [n for n in names if n not in library]
+    if unknown:
+        print(f"未知因子: {', '.join(unknown)}")
+        return
+
+    print(f"\nPolitis-White 自动块长: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}; 评估期限: {horizons} 日")
+
+    rows = []
+    first_ic = None
+    for name in names:
+        for h in horizons:
+            fwd = compute_forward_returns(close, periods=h)
+            ic = compute_ic(library[name], fwd).ic_series.dropna()
+            pw = politi_white_block_length(ic)
+            acf = sample_acf(ic, max(h, 20))
+            rows.append((name, h, ic, pw, acf))
+            if first_ic is None:
+                first_ic = (name, h, ic, pw)
+
+    print("\n" + "=" * 84)
+    print(f"  {'因子':<14}{'h':>3}{'n':>6}{'m_hat':>6}{'M':>5}"
+          f"{'b_SB':>7}{'b_CB':>7}{'rho1':>8}{'rho5':>8}{'rho20':>8}")
+    print("  " + "-" * 80)
+    for name, h, ic, pw, acf in rows:
+        def rho(k):
+            return acf[k] if k < acf.size else float("nan")
+        print(f"  {name:<14}{h:>3}{pw.n:>6}{pw.m_hat:>6}{pw.max_lag:>5}"
+              f"{pw.b_sb:>7.1f}{pw.b_cb:>7.1f}"
+              f"{rho(1):>8.3f}{rho(5):>8.3f}{rho(20):>8.3f}")
+    print("=" * 84)
+    print("  读法: b_SB/b_CB 是序列自身自相关允许的最优块长；")
+    print("        它明显小于评估期限时，按 horizon 取块长是保守的。")
+
+    if args.curve and first_ic is not None:
+        name, h, ic, pw = first_ic
+        sizes = sorted(set([1, 2, 3, 5, 10, 20, 40,
+                            int(round(pw.b_sb)), int(round(pw.b_cb))]))
+        sizes = [s for s in sizes if 1 <= s <= max(len(ic), 1)]
+        curve = bootstrap_se_curve(ic, sizes, n_boot=args.n_boot,
+                                   seed=args.seed)
+        print(f"\n块长-SE 曲线（{name} @ {h} 日，PW 选 {pw.b_sb:.1f}）")
+        print(f"  {'L':>4}{'SE':>10}{'t':>9}{'95% CI':>24}")
+        print("  " + "-" * 46)
+        for row in curve:
+            print(f"  {int(row['block_size']):>4}{row['se']:>10.4f}"
+                  f"{row['t']:>9.2f}"
+                  f"{'[%+.4f,%+.4f]' % (row['ci_low'], row['ci_high']):>24}")
+
+    if args.simulate:
+        sim = coverage_simulation(
+            rho=args.rho, n=args.sim_n, reps=args.sim_reps,
+            n_boot=max(100, args.n_boot // 2), seed=args.seed,
+        )
+        print("\n" + format_coverage_report(sim))
+
+    return rows
 
 
 def cmd_factor_portfolio(args):
@@ -1462,12 +1565,44 @@ def build_parser():
     p_fi.add_argument("--n-boot", type=int, default=2000,
                       help="bootstrap 重采样次数（默认 2000）")
     p_fi.add_argument("--block-size", type=int, default=0,
-                      help="块长；0 表示用评估期限 horizon")
+                      help="块长；0 表示按 --block-method 选")
+    p_fi.add_argument("--block-method",
+                      choices=["horizon", "pw-sb", "pw-cb"],
+                      default="horizon",
+                      help="块长来源：horizon=评估期限, "
+                           "pw-sb/pw-cb=Politis-White 自适应")
     p_fi.add_argument("--method", choices=["circular", "stationary"],
                       default="circular", help="块 bootstrap 方式")
     p_fi.add_argument("--seed", type=int, default=0, help="随机种子")
     p_fi.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_fi.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
+    # factor-blocklength 命令 (v0.23): Politis-White 自动块长
+    p_bl = subparsers.add_parser(
+        "factor-blocklength",
+        help="Politis-White 自动块长：IC 序列自相关有多长",
+    )
+    p_bl.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_bl.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_bl.add_argument("--horizons", default="1,5,20",
+                      help="评估期限（默认 1,5,20）")
+    p_bl.add_argument("--curve", action="store_true",
+                      help="打印块长-SE 曲线（第一个因子/期限）")
+    p_bl.add_argument("--simulate", action="store_true",
+                      help="跑 AR(1) 覆盖率模拟，检验块长是否选对")
+    p_bl.add_argument("--rho", type=float, default=0.5,
+                      help="模拟用的 AR(1) 系数（默认 0.5）")
+    p_bl.add_argument("--sim-n", type=int, default=800,
+                      help="模拟序列长度（默认 800）")
+    p_bl.add_argument("--sim-reps", type=int, default=120,
+                      help="模拟重复次数（默认 120）")
+    p_bl.add_argument("--n-boot", type=int, default=1000,
+                      help="重采样次数（默认 1000）")
+    p_bl.add_argument("--seed", type=int, default=0, help="随机种子")
+    p_bl.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_bl.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
 
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
@@ -1512,6 +1647,8 @@ def main():
         cmd_factor_sensitivity(args)
     elif args.command == "factor-inference":
         cmd_factor_inference(args)
+    elif args.command == "factor-blocklength":
+        cmd_factor_blocklength(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":
