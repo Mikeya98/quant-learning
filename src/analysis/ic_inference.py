@@ -18,10 +18,16 @@ Newey-West 是一个解析近似：用 Bartlett 核估计长期方差，lag 需�
 
 注意：bootstrap 修的是"时间维度的自相关"，修不了样本量小和横截面
 太窄的问题。25 只股票的池子上，两种方法都只能说"不显著"。
+
+Phase 24 在区间上又加了一层：百分位区间假设重采样分布无偏、对称，
+有限样本里不成立；BCa 用 z0 修中位数偏差、用刀切加速度修偏度。
+但对 AR(1) 的覆盖率模拟显示，块长不足造成的 SE 低估它修不了 ——
+区间修正不能替代块长选择。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
@@ -38,6 +44,9 @@ __all__ = [
     "stationary_block_resample",
     "block_bootstrap_mean",
     "bootstrap_se_curve",
+    "bca_interval",
+    "normal_cdf",
+    "normal_ppf",
     "coverage_simulation",
     "compare_inference",
     "format_inference_report",
@@ -53,6 +62,139 @@ def _clean(values: Iterable[float]) -> np.ndarray:
     x = np.asarray(list(values) if not isinstance(values, np.ndarray)
                    else values, dtype=float)
     return x[np.isfinite(x)]
+
+
+# ===================================================================
+# 正态分布辅助函数（BCa 需要）
+# ===================================================================
+
+def normal_cdf(z: float) -> float:
+    """标准正态分布的累积分布函数。"""
+    return 0.5 * math.erfc(-float(z) / math.sqrt(2.0))
+
+
+def normal_ppf(p: float) -> float:
+    """
+    标准正态分布的分位数（Acklam 有理逼近）。
+
+    只要 p 在 (0,1) 开区间内就够了，精度约 1e-9。p<=0 / p>=1 返回
+    ±inf，调用方自己决定怎么夹。
+    """
+    p = float(p)
+    if p <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return math.inf
+
+    a = (-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285104469687e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00)
+
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q
+             + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    elif p <= p_high:
+        q = p - 0.5
+        r = q * q
+        x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r
+             + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r
+                             + b[4]) * r + 1.0)
+    else:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        x = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q
+              + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+
+    # 一步 Halley 修正，把误差压到机器精度
+    e = normal_cdf(x) - p
+    u = e * math.sqrt(2.0 * math.pi) * math.exp(x * x / 2.0)
+    return x - u / (1.0 + x * u / 2.0)
+
+
+# ===================================================================
+# BCa 区间
+# ===================================================================
+
+def bca_interval(
+    means: Sequence[float],
+    values: Sequence[float],
+    *,
+    ci: float = 0.95,
+) -> Tuple[float, float, float, float]:
+    """
+    均值的偏差校正-加速（BCa）置信区间。
+
+    百分位区间只做了"重采样分布"这一件事，有两个已知偏差：
+      - 中位数偏差：bootstrap 分布的中心不一定落在样本统计量上，
+        用 z0 = Φ^-1(P(θ* < θ̂)) 修正；
+      - 偏度/方差随参数变化：用刀切法估一个加速度 a，把区间两端
+        按 a 拉伸或压缩。
+
+    返回 (lo, hi, z0, a)。样本太短或重采样次数太少时退化成百分位区间，
+    此时 z0 = 0、a = 0。
+    """
+    if not 0.0 < ci < 1.0:
+        raise ValueError("ci must be in (0, 1)")
+
+    boot = np.asarray(means, dtype=float)
+    boot = boot[np.isfinite(boot)]
+    x = _clean(values)
+    n = x.size
+
+    if boot.size < 10 or n < 3:
+        alpha = (1.0 - ci) / 2.0
+        if boot.size == 0:
+            return float("nan"), float("nan"), 0.0, 0.0
+        lo, hi = np.percentile(boot, [100.0 * alpha, 100.0 * (1.0 - alpha)])
+        return float(lo), float(hi), 0.0, 0.0
+
+    theta = float(x.mean())
+
+    # 刀切法：去掉第 i 个观测后的均值。对均值来说有闭式解，
+    # 不用真的重算 n 次。
+    jack = (n * theta - x) / (n - 1.0)
+    d = float(jack.mean()) - jack
+    denom = 6.0 * float(np.sum(d * d)) ** 1.5
+    accel = float(np.sum(d * d * d) / denom) if denom > 0.0 else 0.0
+    if not math.isfinite(accel):
+        accel = 0.0
+
+    # 重采样分布里落在 θ̂ 以下的比例。用 0.5/B 夹一下，避免 z0 = ±inf。
+    prop = float(np.mean(boot < theta))
+    prop = min(max(prop, 0.5 / boot.size), 1.0 - 0.5 / boot.size)
+    z0 = normal_ppf(prop)
+
+    alpha = (1.0 - ci) / 2.0
+
+    def _adjust(z_alpha: float) -> float:
+        num = z0 + z_alpha
+        den = 1.0 - accel * num
+        if den <= 0.0:
+            return float("nan")
+        return normal_cdf(z0 + num / den)
+
+    lo_p = _adjust(normal_ppf(alpha))
+    hi_p = _adjust(normal_ppf(1.0 - alpha))
+
+    if not (math.isfinite(lo_p) and math.isfinite(hi_p)) or lo_p >= hi_p:
+        lo, hi = np.percentile(boot, [100.0 * alpha, 100.0 * (1.0 - alpha)])
+        return float(lo), float(hi), float(z0), float(accel)
+
+    lo_p = min(max(lo_p, 0.0), 1.0)
+    hi_p = min(max(hi_p, 0.0), 1.0)
+    lo, hi = np.percentile(boot, [100.0 * lo_p, 100.0 * hi_p])
+    return float(lo), float(hi), float(z0), float(accel)
 
 
 def _circular_indices(n: int, block_size: int, n_boot: int,
@@ -128,10 +270,18 @@ class BootstrapStats:
     method: str
     block_source: str = "fixed"     # fixed / horizon / pw-sb / pw-cb
 
+    # v0.24: BCa（偏差校正-加速）区间，和百分位区间一起给出
+    ci_low_bca: float = float("nan")
+    ci_high_bca: float = float("nan")
+    bca_z0: float = 0.0
+    bca_accel: float = 0.0
+
     def __repr__(self) -> str:
         return (f"BootstrapStats(mean={self.mean:.4f}, se={self.se:.4f}, "
                 f"t={self.t_stat:.2f}, CI=[{self.ci_low:.4f}, "
-                f"{self.ci_high:.4f}], L={self.block_size}, {self.method})")
+                f"{self.ci_high:.4f}], BCa=[{self.ci_low_bca:.4f}, "
+                f"{self.ci_high_bca:.4f}], L={self.block_size}, "
+                f"{self.method})")
 
 
 def _rule_of_thumb_block(n: int) -> int:
@@ -194,6 +344,7 @@ def block_bootstrap_mean(
 
     alpha = (1.0 - ci) / 2.0
     lo, hi = np.percentile(means, [100.0 * alpha, 100.0 * (1.0 - alpha)])
+    bca_lo, bca_hi, z0, accel = bca_interval(means, x, ci=ci)
 
     return BootstrapStats(
         mean=mean,
@@ -206,6 +357,10 @@ def block_bootstrap_mean(
         block_size=L,
         method=method,
         block_source=block_source,
+        ci_low_bca=bca_lo,
+        ci_high_bca=bca_hi,
+        bca_z0=z0,
+        bca_accel=accel,
     )
 
 
@@ -397,7 +552,7 @@ def coverage_simulation(
 
     rows = []
     for L in block_sizes:
-        covered = 0
+        covered = covered_bca = 0
         lengths = []
         for r in range(reps):
             Lr = pw[r] if L is None else float(L)
@@ -408,10 +563,13 @@ def coverage_simulation(
             )
             if st.ci_low <= 0.0 <= st.ci_high:
                 covered += 1
+            if st.ci_low_bca <= 0.0 <= st.ci_high_bca:
+                covered_bca += 1
         rows.append({
             "label": "PW 自适应" if L is None else f"L={int(L)}",
             "mean_block": float(np.mean(lengths)),
             "coverage": covered / reps,
+            "coverage_bca": covered_bca / reps,
         })
 
     # 解析区间对照：普通 t 和 Newey-West，lag 取 PW 对应块长
@@ -428,9 +586,9 @@ def coverage_simulation(
         if abs(nw_t) <= z:
             nw_cov += 1
     rows.append({"label": "普通 t", "mean_block": 1.0,
-                 "coverage": naive_cov / reps})
+                 "coverage": naive_cov / reps, "coverage_bca": None})
     rows.append({"label": "Newey-West", "mean_block": float(np.mean(pw)),
-                 "coverage": nw_cov / reps})
+                 "coverage": nw_cov / reps, "coverage_bca": None})
 
     return CoverageResult(rho=rho, n=n, reps=reps, n_boot=n_boot, rows=rows)
 
@@ -443,15 +601,18 @@ def format_coverage_report(result: CoverageResult,
                  f"reps = {result.reps}, n_boot = {result.n_boot}")
     lines.append(f"  名义覆盖率 = {nominal:.0%}；偏离超过 3 个百分点标 !")
     lines.append("")
-    lines.append(f"  {'方法':<12}{'平均块长':>10}{'覆盖率':>10}   ")
-    lines.append("  " + "-" * 40)
+    lines.append(f"  {'方法':<12}{'平均块长':>10}{'百分位':>10}{'BCa':>10}")
+    lines.append("  " + "-" * 46)
     for row in result.rows:
         flag = " !" if abs(row["coverage"] - nominal) > 0.03 else ""
+        bca = row.get("coverage_bca")
+        bca_text = "-" if bca is None else f"{bca:>9.1%}"
         lines.append(f"  {row['label']:<12}{row['mean_block']:>10.1f}"
-                     f"{row['coverage']:>9.1%}{flag}")
+                     f"{row['coverage']:>9.1%}{flag:>3}{bca_text:>10}")
     lines.append("")
-    lines.append("  读法: 块长 1 丢掉正自相关，区间偏窄，覆盖率系统性偏低；")
-    lines.append("        PW 自适应块长把覆盖率拉回名义水平附近。")
+    lines.append("  读法: 块长 1 丢掉正自相关，百分位区间偏窄、覆盖率系统性")
+    lines.append("        偏低；BCa 用偏差校正和刀切加速度把区间往需要的方向")
+    lines.append("        拉，短块长下的覆盖率通常能补回来一截。")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -468,12 +629,13 @@ def format_inference_report(
     title: str = "IC 显著性：Newey-West vs block bootstrap",
 ) -> str:
     """把 {factor: {horizon: 对比结果}} 摊成一张表。"""
-    lines = ["=" * 78, f"  {title}", "=" * 78, ""]
+    lines = ["=" * 100, f"  {title}", "=" * 100, ""]
     lines.append(
         f"  {'因子':<14}{'h':>3}{'mean_IC':>10}{'t_naive':>9}"
-        f"{'t_NW':>8}{'L':>6}{'t_boot':>9}{'boot_SE':>9}{'95% CI':>22}"
+        f"{'t_NW':>8}{'L':>6}{'t_boot':>9}{'boot_SE':>9}"
+        f"{'CI(百分位)':>22}{'CI(BCa)':>22}"
     )
-    lines.append("  " + "-" * 80)
+    lines.append("  " + "-" * 102)
 
     for name in factors:
         for h in horizons:
@@ -481,10 +643,11 @@ def format_inference_report(
             if r is None:
                 continue
             ci = f"[{r.boot.ci_low:+.4f},{r.boot.ci_high:+.4f}]"
+            bca = f"[{r.boot.ci_low_bca:+.4f},{r.boot.ci_high_bca:+.4f}]"
             lines.append(
                 f"  {name:<14}{h:>3}{r.mean:>10.4f}{r.t_naive:>9.2f}"
                 f"{r.t_nw:>8.2f}{r.boot.block_size:>6.0f}{r.t_boot:>9.2f}"
-                f"{r.boot_se:>9.4f}{ci:>22}"
+                f"{r.boot_se:>9.4f}{ci:>22}{bca:>22}"
             )
 
     lines.append("")
@@ -494,7 +657,9 @@ def format_inference_report(
     lines.append("    lag/块长选得不合适，别只挑一个顺眼的看。")
     lines.append("  - L 是 bootstrap 实际块长；block_method=pw-sb/pw-cb 时")
     lines.append("    由 Politis-White 按序列自身自相关自动选择。")
-    lines.append("  - 95% CI 跨过 0，基本可以当作这条因子在这组数据上")
+    lines.append("  - 百分位区间只看重采样分布；BCa 另外修正了中位数偏差")
+    lines.append("    （z0）和偏度（刀切加速度 a）。两者差异大时优先看 BCa。")
+    lines.append("  - 两种区间都跨过 0，基本可以当作这条因子在这组数据上")
     lines.append("    没有可辨识的方向。")
-    lines.append("=" * 78)
+    lines.append("=" * 100)
     return "\n".join(lines)

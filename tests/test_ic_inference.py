@@ -23,10 +23,14 @@ import numpy as np
 from src.analysis.ic_inference import (
     BootstrapStats,
     InferenceComparison,
+    bca_interval,
     block_bootstrap_mean,
     circular_block_resample,
     compare_inference,
+    coverage_simulation,
     format_inference_report,
+    normal_cdf,
+    normal_ppf,
     stationary_block_resample,
 )
 
@@ -212,7 +216,76 @@ def test_compare():
 
 
 # ===================================================================
-# 7. 报告
+# 7. BCa 区间
+# ===================================================================
+
+def test_bca():
+    print("\n── BCa interval ──")
+    check(abs(normal_cdf(0.0) - 0.5) < 1e-12, "normal_cdf(0) = 0.5")
+    check(abs(normal_cdf(1.959963984540054) - 0.975) < 1e-6,
+          "normal_cdf(1.96) ≈ 0.975")
+    for p in (1e-6, 0.01, 0.25, 0.5, 0.75, 0.99, 1 - 1e-6):
+        check(abs(normal_cdf(normal_ppf(p)) - p) < 1e-9,
+              f"normal_ppf/cdf round-trip at p={p}")
+
+    rng = np.random.default_rng(11)
+    normal = rng.normal(size=400)
+    means = circular_block_resample(normal, 4, n_boot=800, seed=3)
+    lo, hi, z0, accel = bca_interval(means, normal, ci=0.95)
+    check(np.isfinite(lo) and np.isfinite(hi) and lo < hi,
+          "BCa returns a finite ordered interval")
+    check(abs(accel) < 0.05,
+          "acceleration is near zero for symmetric data")
+    plo, phi = np.percentile(means, [2.5, 97.5])
+    check(abs(lo - plo) < 0.02 and abs(hi - phi) < 0.02,
+          "BCa is close to percentile for symmetric data")
+
+    skewed = rng.exponential(size=400)
+    smeans = circular_block_resample(skewed, 4, n_boot=800, seed=3)
+    slo, shi, sz0, saccel = bca_interval(smeans, skewed, ci=0.95)
+    check(np.isfinite(slo) and np.isfinite(shi) and slo < shi,
+          "BCa handles a skewed sample")
+    check(saccel > 0.0, "positive skew gives positive acceleration")
+    check(slo != 0.0 or shi != 0.0, "skewed BCa interval is not degenerate")
+
+    short = bca_interval(np.array([1.0, 2.0]), np.array([1.0, 2.0]))
+    plo2, phi2 = np.percentile([1.0, 2.0], [2.5, 97.5])
+    check(abs(short[0] - plo2) < 1e-12 and abs(short[1] - phi2) < 1e-12 and
+          short[2] == 0.0,
+          "too few bootstrap samples fall back to percentile")
+
+    thrown = 0
+    try:
+        bca_interval(means, normal, ci=1.5)
+    except ValueError:
+        thrown += 1
+    check(thrown == 1, "invalid ci raises ValueError")
+
+    st = block_bootstrap_mean(normal, block_size=4, n_boot=400, seed=1)
+    check(np.isfinite(st.ci_low_bca) and np.isfinite(st.ci_high_bca),
+          "BootstrapStats carries BCa bounds")
+    check(abs(st.bca_z0) < 0.5 and abs(st.bca_accel) < 0.05,
+          "z0/acceleration are small for symmetric data")
+
+
+# ===================================================================
+# 8. 覆盖率模拟里的 BCa 对照
+# ===================================================================
+
+def test_coverage_bca():
+    print("\n── coverage: percentile vs BCa ──")
+    res = coverage_simulation(rho=0.6, n=64, reps=10, n_boot=60,
+                              block_sizes=(1, 10), seed=5)
+    check(len(res.rows) == 4, "two block sizes + two analytic rows")
+    for row in res.rows[:2]:
+        check(0.0 <= row["coverage"] <= 1.0, "percentile coverage in [0,1]")
+        check(0.0 <= row["coverage_bca"] <= 1.0, "BCa coverage in [0,1]")
+    check(res.rows[2]["coverage_bca"] is None,
+          "analytic rows have no BCa column")
+
+
+# ===================================================================
+# 9. 报告
 # ===================================================================
 
 def test_report():
@@ -225,7 +298,7 @@ def test_report():
     text = format_inference_report(results, ["momentum_20"], [1, 5])
 
     for needle in ("Newey-West vs block bootstrap", "t_naive", "t_NW",
-                   "t_boot", "95% CI", "momentum_20", "读法"):
+                   "t_boot", "CI(百分位)", "CI(BCa)", "momentum_20", "读法"):
         check(needle in text, f"report contains '{needle}'")
 
 
@@ -240,6 +313,8 @@ def main():
     test_ci()
     test_edges()
     test_compare()
+    test_bca()
+    test_coverage_bca()
     test_report()
 
     print(f"\n  Result: {PASS} passed, {FAIL} failed")
