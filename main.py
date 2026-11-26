@@ -943,6 +943,79 @@ def cmd_factor_blocklength(args):
     return rows
 
 
+def cmd_factor_decay(args):
+    """因子衰减与持有期 (v0.25)"""
+    from src.analysis.factor_research import make_factors
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.analysis.factor_decay import (
+        format_decay_report,
+        holding_period_table,
+        ic_half_life,
+    )
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("因子衰减至少需要 5 只标的（横截面才有意义）")
+        return
+
+    try:
+        horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
+    except ValueError:
+        print("--horizons 必须是逗号分隔的整数")
+        return
+    if not horizons or any(h <= 0 for h in horizons):
+        print("--horizons 必须是正整数")
+        return
+    if not 0 < args.top_frac < 0.5:
+        print("--top-frac 必须在 (0, 0.5) 之间")
+        return
+    if args.cost_bps < 0:
+        print("--cost-bps 不能为负")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    library = make_factors(close, volume=volume, turnover=turnover)
+    unknown = [n for n in names if n not in library]
+    if unknown:
+        print(f"未知因子: {', '.join(unknown)}")
+        return
+
+    print(f"\n因子衰减: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"因子: {', '.join(names)}; 持有期: {horizons} 日")
+
+    tables = {}
+    half_lives = {}
+    for name in names:
+        tables[name] = holding_period_table(
+            library[name], close, horizons=horizons,
+            top_frac=args.top_frac, cost_bps=args.cost_bps,
+            n_quantiles=args.quantiles,
+        )
+        hl = ic_half_life(tables[name][["mean_ic"]])
+        half_lives[name] = hl
+
+    print("\n" + format_decay_report(tables, cost_bps=args.cost_bps,
+                                     top_frac=args.top_frac))
+
+    print("\n  IC 半衰期（按给定持有期序列线性插值）")
+    for name in names:
+        hl = half_lives[name]
+        text = f"{hl:.1f} 个交易日" if hl is not None else "未衰减到一半"
+        print(f"    {name:<16}{text}")
+
+    return tables
+
+
 def cmd_factor_portfolio(args):
     """多因子选股 → 组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1604,6 +1677,26 @@ def build_parser():
     p_bl.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_bl.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
 
+    # factor-decay 命令 (v0.25): 因子衰减 + 换手率 + 净收益
+    p_fd = subparsers.add_parser(
+        "factor-decay",
+        help="因子衰减与持有期：IC 衰减 / 换手率 / 扣成本后的净收益",
+    )
+    p_fd.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_fd.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_fd.add_argument("--horizons", default="1,2,3,5,10,20",
+                      help="持有期序列（默认 1,2,3,5,10,20）")
+    p_fd.add_argument("--top-frac", type=float, default=0.2,
+                      help="多空组合取最高/最低的比例（默认 0.2）")
+    p_fd.add_argument("--cost-bps", type=float, default=15.0,
+                      help="单边交易成本 bps（默认 15）")
+    p_fd.add_argument("--quantiles", type=int, default=5,
+                      help="分层数量（默认 5）")
+    p_fd.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fd.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -1649,6 +1742,8 @@ def main():
         cmd_factor_inference(args)
     elif args.command == "factor-blocklength":
         cmd_factor_blocklength(args)
+    elif args.command == "factor-decay":
+        cmd_factor_decay(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":
