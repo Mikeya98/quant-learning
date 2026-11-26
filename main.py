@@ -1016,6 +1016,68 @@ def cmd_factor_decay(args):
     return tables
 
 
+def cmd_factor_band(args):
+    """调仓缓冲带 (v0.26)"""
+    from src.analysis.factor_research import make_factors
+    from src.strategy.factor_selection import DEFAULT_FACTORS
+    from src.analysis.trade_band import band_comparison, format_band_report
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    if len(symbols) < 5:
+        print("调仓缓冲带至少需要 5 只标的")
+        return
+
+    try:
+        bands = [float(x) for x in args.bands.split(",") if x.strip()]
+    except ValueError:
+        print("--bands 必须是逗号分隔的数字")
+        return
+    if not bands or any(b < 1.0 for b in bands):
+        print("--bands 必须都 >= 1.0（1.0 表示无缓冲）")
+        return
+    if args.holding <= 0:
+        print("--holding 必须是正整数")
+        return
+    if not 0 < args.top_frac < 0.5:
+        print("--top-frac 必须在 (0, 0.5) 之间")
+        return
+
+    start = pd.to_datetime(args.start)
+    end = pd.to_datetime(args.end)
+    close, volume, turnover, _ = _load_universe(symbols, start, end)
+    if close.shape[1] < 5:
+        print(f"可用标的只有 {close.shape[1]} 只，至少需要 5 只")
+        return
+
+    names = [f.strip() for f in args.factors.split(",") if f.strip()] \
+        if args.factors else list(DEFAULT_FACTORS)
+
+    library = make_factors(close, volume=volume, turnover=turnover)
+    unknown = [n for n in names if n not in library]
+    if unknown:
+        print(f"未知因子: {', '.join(unknown)}")
+        return
+
+    print(f"\n调仓缓冲带: {close.shape[1]} 只标的, "
+          f"{close.index[0].date()} ~ {close.index[-1].date()}")
+    print(f"持有期 {args.holding} 日, 多空各 {args.top_frac:.0%}, "
+          f"单边成本 {args.cost_bps:.1f} bp")
+
+    tables = {}
+    for name in names:
+        tables[name] = band_comparison(
+            library[name], close,
+            holding_days=args.holding,
+            top_frac=args.top_frac,
+            bands=bands,
+            cost_bps=args.cost_bps,
+        )
+
+    print("\n" + format_band_report(tables, args.holding,
+                                    cost_bps=args.cost_bps))
+    return tables
+
+
 def cmd_factor_portfolio(args):
     """多因子选股 → 组合回测"""
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1697,6 +1759,26 @@ def build_parser():
     p_fd.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
     p_fd.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
 
+    # factor-band 命令 (v0.26): 调仓缓冲带
+    p_fb = subparsers.add_parser(
+        "factor-band",
+        help="调仓缓冲带：少换一点，换手/成本/净收益怎么变",
+    )
+    p_fb.add_argument("--symbols", required=True,
+                      help="股票代码列表，逗号分隔")
+    p_fb.add_argument("--factors", default="",
+                      help="因子，逗号分隔（默认动量+反转+低波）")
+    p_fb.add_argument("--holding", type=int, default=5,
+                      help="持有期/调仓间隔，交易日（默认 5）")
+    p_fb.add_argument("--top-frac", type=float, default=0.2,
+                      help="多空组合取最高/最低的比例（默认 0.2）")
+    p_fb.add_argument("--bands", default="1.0,1.2,1.5,2.0",
+                      help="缓冲带倍数，逗号分隔（默认 1.0,1.2,1.5,2.0）")
+    p_fb.add_argument("--cost-bps", type=float, default=15.0,
+                      help="单边交易成本 bps（默认 15）")
+    p_fb.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD")
+    p_fb.add_argument("--end", default="20241231", help="结束日期 YYYYMMDD")
+
     # universe 命令
     p_univ = subparsers.add_parser("universe", help="选股票池（按流通市值前 N）")
     p_univ.add_argument("--top", type=int, default=50,
@@ -1744,6 +1826,8 @@ def main():
         cmd_factor_blocklength(args)
     elif args.command == "factor-decay":
         cmd_factor_decay(args)
+    elif args.command == "factor-band":
+        cmd_factor_band(args)
     elif args.command == "factor-portfolio":
         cmd_factor_portfolio(args)
     elif args.command == "universe":
